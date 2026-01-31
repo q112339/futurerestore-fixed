@@ -2,29 +2,30 @@ name: Build Futurerestore Windows
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
       with:
-        submodules: recursive
-        
+        submodules: false  # 禁用自动子模块，手动克隆
+      
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
         msystem: UCRT64
         update: true
         install: >-
+          base-devel
+          mingw-w64-ucrt-x86_64-toolchain
           mingw-w64-ucrt-x86_64-gcc
           mingw-w64-ucrt-x86_64-cmake
           mingw-w64-ucrt-x86_64-autotools
@@ -37,25 +38,20 @@ jobs:
           mingw-w64-ucrt-x86_64-libirecovery
           mingw-w64-ucrt-x86_64-libimobiledevice
           git
-          make
-          automake
-          libtool
-          autoconf
 
-    - name: Clone missing submodules manually
+    - name: Clone dependencies manually
       run: |
         cd external
-        # 确保所有子模块都下载了
-        git clone --depth 1 https://github.com/tihmstar/libgeneral.git || true
-        git clone --depth 1 https://github.com/tihmstar/libfragmentzip.git || true
-        git clone --depth 1 https://github.com/tihmstar/img4tool.git || true
+        rm -rf idevicerestore tsschecker libgeneral libfragmentzip img4tool
+        git clone --depth 1 https://github.com/marijuanARM/idevicerestore.git
+        git clone --depth 1 https://github.com/tihmstar/tsschecker.git
+        git clone --depth 1 https://github.com/tihmstar/libgeneral.git
+        git clone --depth 1 https://github.com/tihmstar/libfragmentzip.git
+        git clone --depth 1 https://github.com/tihmstar/img4tool.git
+        
+        # Clone tsschecker submodules manually
         cd tsschecker/external
-        git clone --depth 1 https://github.com/tihmstar/jssy.git || true
-
-    - name: Apply fixes (Download retry and 32-bit compatibility)
-      run: |
-        # 这里会自动应用你上传的修改文件
-        echo "Fixes applied via uploaded files"
+        git clone --depth 1 https://github.com/tihmstar/jssy.git
 
     - name: Build libgeneral
       run: |
@@ -102,19 +98,13 @@ jobs:
         autoreconf -fi
         ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64 \
           CXXFLAGS="-DCURL_STATICLIB -O2" \
-          LDFLAGS="-static-libgcc -static-libstdc++"
+          LDFLAGS="-static-libgcc -static-libstdc++ -lws2_32 -lwinmm"
         make -j4
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
+      if: success()  # 只有成功时才上传
       with:
         name: futurerestore-windows
         path: futurerestore/futurerestore.exe
-        
-    - name: Create Release
-      if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: futurerestore/futurerestore.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if-no-files-found: warn
