@@ -1,0 +1,5 @@
+Making all in external/idevicerestore
+make[1]: Entering directory '/d/futurerestore-194/external/idevicerestore'
+make[1]: *** No rule to make target 'all'.  Stop.
+make[1]: Leaving directory '/d/futurerestore-194/external/idevicerestore'
+make: *** [Makefile:344: all-recursive] Error 1

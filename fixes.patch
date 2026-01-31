@@ -1,0 +1,68 @@
+--- a/external/tsschecker/tsschecker/FirmwareAPI_IPSWME.cpp
++++ b/external/tsschecker/tsschecker/FirmwareAPI_IPSWME.cpp
+@@ -12,8 +12,11 @@ extern "C"{
+ 
+ using namespace tihmstar::tsschecker;
+ 
+-#define FIRMWARE_JSON_URL "https://api.ipsw.me/v2.1/firmwares.json/condensed "
+-#define FIRMWARE_OTA_JSON_URL "https://api.ipsw.me/v2.1/ota.json/condensed "
++// 多镜像源定义（修复Windows下载抽风）
++#define FIRMWARE_JSON_URL_PRIMARY "https://api.ipsw.me/v2.1/firmwares.json/condensed"
++#define FIRMWARE_JSON_URL_MIRROR1 "https://ghproxy.com/https://api.ipsw.me/v2.1/firmwares.json/condensed"
++#define FIRMWARE_OTA_JSON_URL_PRIMARY "https://api.ipsw.me/v2.1/ota.json/condensed"
++#define FIRMWARE_OTA_JSON_URL_MIRROR1 "https://ghproxy.com/https://api.ipsw.me/v2.1/ota.json/condensed"
+ 
+ FirmwareAPI_IPSWME::FirmwareAPI_IPSWME(bool ota)
+ : _ota(ota), _tokens(NULL)
+@@ -25,15 +28,54 @@ FirmwareAPI_IPSWME::~FirmwareAPI_IPSWME(){
+ 
+ #pragma mark public
+ 
+ void FirmwareAPI_IPSWME::load(){
+     long tokencnt = 0;
+-    _buf = tsschecker::downloadFile(_ota ? FIRMWARE_OTA_JSON_URL : FIRMWARE_JSON_URL);
++    int retry = 0;
++    const int maxRetries = 3;
++    std::string lastError;
++    
++    // 多镜像源重试机制
++    const char* urls[] = {
++        _ota ? FIRMWARE_OTA_JSON_URL_PRIMARY : FIRMWARE_JSON_URL_PRIMARY,
++        _ota ? FIRMWARE_OTA_JSON_URL_MIRROR1 : FIRMWARE_JSON_URL_MIRROR1
++    };
++    int urlCount = 2;
++    
++    while (retry < maxRetries) {
++        const char* currentUrl = urls[retry % urlCount];
++        printf("[TSSC] 正在下载固件列表: %s (尝试 %d/%d)\n", currentUrl, retry+1, maxRetries);
++        
++        try {
++            _buf = tsschecker::downloadFile(currentUrl);
++            
++            // 验证下载内容
++            if (_buf.size() < 1000) {
++                throw std::runtime_error("下载内容过小，可能网络异常");
++            }
++            
+     retassure((tokencnt = jssy_parse((const char*)_buf.data(), _buf.size(), NULL, 0)) > 0, "Failed to parse json");
+     safeFree(_tokens);
+     _tokens = (jssytok_t*)calloc(1, tokencnt * sizeof(jssytok_t));
+     retassure((tokencnt = jssy_parse((const char*)_buf.data(), _buf.size(), _tokens, tokencnt * sizeof(jssytok_t))) > 1, "Failed to parse json");
++            
++            printf("[TSSC] 固件列表加载成功 (%zu bytes)\n", _buf.size());
++            return; // 成功，直接返回
++            
++        } catch (tihmstar::exception &e) {
++            lastError = e.what();
++            printf("[TSSC] 下载失败: %s\n", lastError.c_str());
++            retry++;
++            if (retry < maxRetries) {
++                printf("[TSSC] 等待2秒后重试...\n");
++                sleep(2);
++            }
++        }
++    }
++    
++    // 所有重试都失败
++    reterror("[TSSC] 所有镜像源都失败了，最后一次错误: %s", lastError.c_str());
+ }

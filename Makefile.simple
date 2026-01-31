@@ -1,0 +1,41 @@
+CXX = x86_64-w64-mingw32-g++
+CC = x86_64-w64-mingw32-gcc
+CFLAGS = -O2 -DCURL_STATICLIB -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_WIN32 -DWIN32 \
+    -I/ucrt64/include \
+    -I/d/futurerestore-194/external/tsschecker/include \
+    -I/d/futurerestore-194/external/tsschecker/external/jssy \
+    -I/d/futurerestore-194/external/tsschecker/external/jssy/jssy \
+    -I/d/futurerestore-194/external/libgeneral/include \
+    -I/d/futurerestore-194/external/idevicerestore/src \
+    -I/d/futurerestore-194/external/libfragmentzip/include \
+    -I/d/futurerestore-194/futurerestore
+
+SRC = futurerestore/futurerestore.cpp futurerestore/main.cpp \
+    external/tsschecker/tsschecker/tsschecker.cpp \
+    external/tsschecker/tsschecker/FirmwareAPI_IPSWME.cpp \
+    external/tsschecker/tsschecker/FirmwareAPI.cpp \
+    external/tsschecker/tsschecker/TssRequest.cpp \
+    external/tsschecker/tsschecker/TSSException.cpp \
+    external/tsschecker/external/jssy/jssy/jssy.c
+
+OBJ = $(SRC:.cpp=.o)
+OBJ := $(OBJ:.c=.o)
+
+.PHONY: all clean
+
+all: futurerestore.exe
+
+futurerestore.exe: $(OBJ)
+	$(CXX) -o $@ $^ -static-libgcc -static-libstdc++ \
+	-L/ucrt64/lib -lws2_32 -lwinmm -lcrypt32 -lcurl -lzip -lz \
+	-lplist-2.0 -lirecovery-1.0 -limobiledevice-1.0 \
+	-lusbmuxd-2.0 -limobiledevice-glue-1.0 -lssl -lcrypto
+
+%.o: %.cpp
+	$(CXX) $(CFLAGS) -c $< -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJ) futurerestore.exe

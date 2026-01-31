@@ -1,0 +1,394 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 50;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2AAE83AD2906DC1500AA1083 /* libcrypto.3.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 2AAE83AC2906DC1500AA1083 /* libcrypto.3.dylib */; };
+		2AAE83AE2906DC1500AA1083 /* libcrypto.3.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 2AAE83AC2906DC1500AA1083 /* libcrypto.3.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		8746A34F2C48DEDD00AB2921 /* libplist-2.0.4.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 8746A34E2C48DEDD00AB2921 /* libplist-2.0.4.dylib */; };
+		8746A3502C48DEDD00AB2921 /* libplist-2.0.4.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 8746A34E2C48DEDD00AB2921 /* libplist-2.0.4.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		8754A6B1236F16B600C0D285 /* libgeneral.0.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 8754A6B0236F16B600C0D285 /* libgeneral.0.dylib */; };
+		8754A6B2236F16B600C0D285 /* libgeneral.0.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 8754A6B0236F16B600C0D285 /* libgeneral.0.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		876D341425DE5E330059C1F5 /* libcompression.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 875585D6238967C500B90FC9 /* libcompression.tbd */; };
+		879896AD2344A91900A98709 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 879896AC2344A91900A98709 /* main.cpp */; };
+		879B59F92DDDAA1D00273349 /* libfwkeyfetch.0.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 879B59F82DDDAA1D00273349 /* libfwkeyfetch.0.dylib */; };
+		879B59FA2DDDAA1D00273349 /* libfwkeyfetch.0.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 879B59F82DDDAA1D00273349 /* libfwkeyfetch.0.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		87A281342347B7B900ED08BB /* ASN1DERElement.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 87A281322347B7B900ED08BB /* ASN1DERElement.cpp */; };
+		87A281372347B7CA00ED08BB /* img4tool.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 87A281352347B7CA00ED08BB /* img4tool.cpp */; };
+		87EB3A6923561EE2008F1B06 /* lzssdec.c in Sources */ = {isa = PBXBuildFile; fileRef = 87EB3A6823561EE2008F1B06 /* lzssdec.c */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		8754A6B3236F16B600C0D285 /* Embed Libraries */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				8754A6B2236F16B600C0D285 /* libgeneral.0.dylib in Embed Libraries */,
+				2AAE83AE2906DC1500AA1083 /* libcrypto.3.dylib in Embed Libraries */,
+				879B59FA2DDDAA1D00273349 /* libfwkeyfetch.0.dylib in Embed Libraries */,
+				8746A3502C48DEDD00AB2921 /* libplist-2.0.4.dylib in Embed Libraries */,
+			);
+			name = "Embed Libraries";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		879896A72344A91900A98709 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = /usr/share/man/man1/;
+			dstSubfolderSpec = 0;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 1;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		2AAE83A92906DB0600AA1083 /* libcrypto.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.1.dylib; path = "../../../../opt/homebrew/Cellar/openssl@1.1/1.1.1q/lib/libcrypto.1.1.dylib"; sourceTree = "<group>"; };
+		2AAE83AC2906DC1500AA1083 /* libcrypto.3.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.3.dylib; path = ../../../../usr/local/lib/libcrypto.3.dylib; sourceTree = "<group>"; };
+		4281CC81234A01C500C30E6D /* libplist.3.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libplist.3.dylib; path = ../../../../usr/local/lib/libplist.3.dylib; sourceTree = "<group>"; };
+		42F86F722351EA61009649E4 /* libssl.1.0.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libssl.1.0.0.dylib; path = ../../../../usr/local/Cellar/openssl/1.0.2s/lib/libssl.1.0.0.dylib; sourceTree = "<group>"; };
+		42F86F742351EAA2009649E4 /* libcrypto.1.0.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.0.0.dylib; path = ../../../../usr/local/Cellar/openssl/1.0.2s/lib/libcrypto.1.0.0.dylib; sourceTree = "<group>"; };
+		8706A315275E624300FB4706 /* libcrypto.3.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.3.dylib; path = "../../../../opt/homebrew/Cellar/openssl@3/3.0.0_1/lib/libcrypto.3.dylib"; sourceTree = "<group>"; };
+		873E047727A7FDF2004BA5CE /* libssl.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libssl.1.1.dylib; path = "../../../../opt/homebrew/Cellar/openssl@1.1/1.1.1m/lib/libssl.1.1.dylib"; sourceTree = "<group>"; };
+		873E047A27A7FE14004BA5CE /* libcrypto.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.1.dylib; path = "../../../../opt/homebrew/Cellar/openssl@1.1/1.1.1m/lib/libcrypto.1.1.dylib"; sourceTree = "<group>"; };
+		8746A34E2C48DEDD00AB2921 /* libplist-2.0.4.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = "libplist-2.0.4.dylib"; path = "../../../../usr/local/lib/libplist-2.0.4.dylib"; sourceTree = "<group>"; };
+		8754A6B0236F16B600C0D285 /* libgeneral.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libgeneral.0.dylib; path = ../../../../usr/local/lib/libgeneral.0.dylib; sourceTree = "<group>"; };
+		875585D6238967C500B90FC9 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
+		8762F342236DDFD400F42FDB /* img4tool.hpp.in */ = {isa = PBXFileReference; explicitFileType = sourcecode.cpp.h; name = img4tool.hpp.in; path = include/img4tool/img4tool.hpp.in; sourceTree = SOURCE_ROOT; };
+		8776E51125C46299002971E6 /* libplist-2.0.3.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = "libplist-2.0.3.dylib"; path = "../../../../usr/local/lib/libplist-2.0.3.dylib"; sourceTree = "<group>"; };
+		8776E51425C462B0002971E6 /* libcrypto.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.1.dylib; path = "../../../../usr/local/Cellar/openssl@1.1/1.1.1i/lib/libcrypto.1.1.dylib"; sourceTree = "<group>"; };
+		8791272924D0ABA30071283F /* libcrypto.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.1.dylib; path = "../../../../usr/local/Cellar/openssl@1.1/1.1.1g/lib/libcrypto.1.1.dylib"; sourceTree = "<group>"; };
+		879896A92344A91900A98709 /* img4tool */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = img4tool; sourceTree = BUILT_PRODUCTS_DIR; };
+		879896AC2344A91900A98709 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
+		879B59F82DDDAA1D00273349 /* libfwkeyfetch.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libfwkeyfetch.0.dylib; path = ../../../../usr/local/lib/libfwkeyfetch.0.dylib; sourceTree = "<group>"; };
+		87A281322347B7B900ED08BB /* ASN1DERElement.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ASN1DERElement.cpp; sourceTree = "<group>"; };
+		87A281332347B7B900ED08BB /* ASN1DERElement.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; name = ASN1DERElement.hpp; path = ../include/img4tool/ASN1DERElement.hpp; sourceTree = "<group>"; };
+		87A281352347B7CA00ED08BB /* img4tool.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = img4tool.cpp; sourceTree = "<group>"; };
+		87A281362347B7CA00ED08BB /* img4tool.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; name = img4tool.hpp; path = ../include/img4tool/img4tool.hpp; sourceTree = "<group>"; };
+		87D69FE1265BE79600AB8610 /* libcrypto.1.1.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.1.dylib; path = "../../../../opt/homebrew/Cellar/openssl@1.1/1.1.1k/lib/libcrypto.1.1.dylib"; sourceTree = "<group>"; };
+		87E6A5FA24A75AA10081D457 /* libssl.1.0.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libssl.1.0.0.dylib; path = ../../../../usr/local/Cellar/openssl/1.0.2t/lib/libssl.1.0.0.dylib; sourceTree = "<group>"; };
+		87E6A5FD24A75AC70081D457 /* libcrypto.1.0.0.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libcrypto.1.0.0.dylib; path = ../../../../usr/local/Cellar/openssl/1.0.2t/lib/libcrypto.1.0.0.dylib; sourceTree = "<group>"; };
+		87EB3A6723561EE2008F1B06 /* lzssdec.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = lzssdec.h; sourceTree = "<group>"; };
+		87EB3A6823561EE2008F1B06 /* lzssdec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = lzssdec.c; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		879896A62344A91900A98709 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8746A34F2C48DEDD00AB2921 /* libplist-2.0.4.dylib in Frameworks */,
+				2AAE83AD2906DC1500AA1083 /* libcrypto.3.dylib in Frameworks */,
+				8754A6B1236F16B600C0D285 /* libgeneral.0.dylib in Frameworks */,
+				876D341425DE5E330059C1F5 /* libcompression.tbd in Frameworks */,
+				879B59F92DDDAA1D00273349 /* libfwkeyfetch.0.dylib in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		4281CC80234A01C500C30E6D /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				879B59F82DDDAA1D00273349 /* libfwkeyfetch.0.dylib */,
+				8746A34E2C48DEDD00AB2921 /* libplist-2.0.4.dylib */,
+				2AAE83AC2906DC1500AA1083 /* libcrypto.3.dylib */,
+				873E047A27A7FE14004BA5CE /* libcrypto.1.1.dylib */,
+				2AAE83A92906DB0600AA1083 /* libcrypto.1.1.dylib */,
+				873E047727A7FDF2004BA5CE /* libssl.1.1.dylib */,
+				8706A315275E624300FB4706 /* libcrypto.3.dylib */,
+				8776E51425C462B0002971E6 /* libcrypto.1.1.dylib */,
+				87D69FE1265BE79600AB8610 /* libcrypto.1.1.dylib */,
+				8776E51125C46299002971E6 /* libplist-2.0.3.dylib */,
+				8791272924D0ABA30071283F /* libcrypto.1.1.dylib */,
+				87E6A5FD24A75AC70081D457 /* libcrypto.1.0.0.dylib */,
+				87E6A5FA24A75AA10081D457 /* libssl.1.0.0.dylib */,
+				875585D6238967C500B90FC9 /* libcompression.tbd */,
+				8754A6B0236F16B600C0D285 /* libgeneral.0.dylib */,
+				42F86F742351EAA2009649E4 /* libcrypto.1.0.0.dylib */,
+				42F86F722351EA61009649E4 /* libssl.1.0.0.dylib */,
+				4281CC81234A01C500C30E6D /* libplist.3.dylib */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		879896A02344A91900A98709 = {
+			isa = PBXGroup;
+			children = (
+				879896AB2344A91900A98709 /* img4tool */,
+				879896AA2344A91900A98709 /* Products */,
+				4281CC80234A01C500C30E6D /* Frameworks */,
+			);
+			sourceTree = "<group>";
+		};
+		879896AA2344A91900A98709 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				879896A92344A91900A98709 /* img4tool */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		879896AB2344A91900A98709 /* img4tool */ = {
+			isa = PBXGroup;
+			children = (
+				87A281332347B7B900ED08BB /* ASN1DERElement.hpp */,
+				87A281322347B7B900ED08BB /* ASN1DERElement.cpp */,
+				87EB3A6723561EE2008F1B06 /* lzssdec.h */,
+				87EB3A6823561EE2008F1B06 /* lzssdec.c */,
+				8762F342236DDFD400F42FDB /* img4tool.hpp.in */,
+				87A281362347B7CA00ED08BB /* img4tool.hpp */,
+				87A281352347B7CA00ED08BB /* img4tool.cpp */,
+				879896AC2344A91900A98709 /* main.cpp */,
+			);
+			path = img4tool;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		879896A82344A91900A98709 /* img4tool */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 879896B02344A91900A98709 /* Build configuration list for PBXNativeTarget "img4tool" */;
+			buildPhases = (
+				879896A52344A91900A98709 /* Sources */,
+				879896A62344A91900A98709 /* Frameworks */,
+				879896A72344A91900A98709 /* CopyFiles */,
+				8754A6B3236F16B600C0D285 /* Embed Libraries */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = img4tool;
+			productName = img4tool;
+			productReference = 879896A92344A91900A98709 /* img4tool */;
+			productType = "com.apple.product-type.tool";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		879896A12344A91900A98709 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1010;
+				ORGANIZATIONNAME = tihmstar;
+				TargetAttributes = {
+					879896A82344A91900A98709 = {
+						CreatedOnToolsVersion = 10.1;
+					};
+				};
+			};
+			buildConfigurationList = 879896A42344A91900A98709 /* Build configuration list for PBXProject "img4tool" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+			);
+			mainGroup = 879896A02344A91900A98709;
+			productRefGroup = 879896AA2344A91900A98709 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				879896A82344A91900A98709 /* img4tool */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		879896A52344A91900A98709 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				879896AD2344A91900A98709 /* main.cpp in Sources */,
+				87A281342347B7B900ED08BB /* ASN1DERElement.cpp in Sources */,
+				87A281372347B7CA00ED08BB /* img4tool.cpp in Sources */,
+				87EB3A6923561EE2008F1B06 /* lzssdec.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		879896AE2344A91900A98709 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 10.13;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		879896AF2344A91900A98709 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 10.13;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		879896B12344A91900A98709 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"HAVE_PLIST=1",
+					"HAVE_CRYPTO=1",
+					"HAVE_OPENSSL=1",
+					"HAVE_LIBCOMPRESSION=1",
+					XCODE,
+					"HAVE_LIBFWKEYFETCH=1",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+					"$(SRCROOT)/include/img4tool",
+					/usr/local/include,
+				);
+				LIBRARY_SEARCH_PATHS = /usr/local/lib;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		879896B22344A91900A98709 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GCC_PREPROCESSOR_DEFINITIONS = "";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+					"$(SRCROOT)/include/img4tool",
+					/usr/local/include,
+				);
+				LIBRARY_SEARCH_PATHS = /usr/local/lib;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		879896A42344A91900A98709 /* Build configuration list for PBXProject "img4tool" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				879896AE2344A91900A98709 /* Debug */,
+				879896AF2344A91900A98709 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		879896B02344A91900A98709 /* Build configuration list for PBXNativeTarget "img4tool" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				879896B12344A91900A98709 /* Debug */,
+				879896B22344A91900A98709 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 879896A12344A91900A98709 /* Project object */;
+}
