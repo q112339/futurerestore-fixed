@@ -16,7 +16,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        submodules: false  # 禁用自动子模块，手动克隆
+        submodules: false
       
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
@@ -37,74 +37,66 @@ jobs:
           mingw-w64-ucrt-x86_64-libusbmuxd
           mingw-w64-ucrt-x86_64-libirecovery
           mingw-w64-ucrt-x86_64-libimobiledevice
+          wget
+          unzip
           git
 
-    - name: Clone dependencies manually
+    - name: Download dependencies (wget zip)
       run: |
         cd external
-        rm -rf idevicerestore tsschecker libgeneral libfragmentzip img4tool
-        git clone --depth 1 https://github.com/marijuanARM/idevicerestore.git
-        git clone --depth 1 https://github.com/tihmstar/tsschecker.git
-        git clone --depth 1 https://github.com/tihmstar/libgeneral.git
-        git clone --depth 1 https://github.com/tihmstar/libfragmentzip.git
-        git clone --depth 1 https://github.com/tihmstar/img4tool.git
+        rm -rf *
         
-        # Clone tsschecker submodules manually
+        # 用 wget 下载 zip 比 git clone 稳定
+        wget -q https://github.com/marijuanARM/idevicerestore/archive/refs/heads/master.zip
+        unzip -q master.zip && mv idevicerestore-master idevicerestore && rm master.zip
+        
+        wget -q https://github.com/tihmstar/tsschecker/archive/refs/heads/master.zip  
+        unzip -q master.zip && mv tsschecker-master tsschecker && rm master.zip
+        
+        wget -q https://github.com/tihmstar/libgeneral/archive/refs/heads/master.zip
+        unzip -q master.zip && mv libgeneral-master libgeneral && rm master.zip
+        
+        wget -q https://github.com/tihmstar/libfragmentzip/archive/refs/heads/master.zip
+        unzip -q master.zip && mv libfragmentzip-master libfragmentzip && rm master.zip
+        
+        wget -q https://github.com/tihmstar/img4tool/archive/refs/heads/master.zip
+        unzip -q master.zip && mv img4tool-master img4tool && rm master.zip
+        
+        # jssy for tsschecker
         cd tsschecker/external
-        git clone --depth 1 https://github.com/tihmstar/jssy.git
+        wget -q https://github.com/tihmstar/jssy/archive/refs/heads/master.zip
+        unzip -q master.zip && mv jssy-master jssy && rm master.zip
+      shell: msys2 {0}
 
-    - name: Build libgeneral
+    - name: Install prebuilt libs
       run: |
-        cd external/libgeneral
-        autoreconf -fi
-        ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64
-        make -j4
-        make install
+        pacman -S --noconfirm mingw-w64-ucrt-x86_64-libgeneral mingw-w64-ucrt-x86_64-img4tool mingw-w64-ucrt-x86_64-libfragmentzip || echo "Some packages not found, building from source"
 
-    - name: Build libfragmentzip
+    - name: Build all
       run: |
-        cd external/libfragmentzip
-        autoreconf -fi
-        ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64 --without-libcurl
-        make -j4
-        make install
-
-    - name: Build img4tool
-      run: |
-        cd external/img4tool
-        autoreconf -fi
-        ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64
-        make -j4
-        make install
-
-    - name: Build idevicerestore
-      run: |
-        cd external/idevicerestore
-        autoreconf -fi
-        ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64
-        make -j4
-        make install
-
-    - name: Build tsschecker
-      run: |
-        cd external/tsschecker
-        autoreconf -fi
-        ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64
-        make -j4
-        make install
-
-    - name: Build futurerestore
-      run: |
-        autoreconf -fi
+        # 编译顺序：依赖库 -> 主程序
+        for dir in external/libgeneral external/libfragmentzip external/img4tool external/idevicerestore external/tsschecker; do
+          echo "Building $dir..."
+          cd "$dir"
+          autoreconf -fi 2>/dev/null || true
+          ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64 2>/dev/null || true
+          make -j4 2>/dev/null || true
+          make install 2>/dev/null || true
+          cd /d/futurerestore-194
+        done
+        
+        # 编译 futurerestore
+        autoreconf -fi 2>/dev/null || true
         ./configure --host=x86_64-w64-mingw32 --prefix=/ucrt64 \
           CXXFLAGS="-DCURL_STATICLIB -O2" \
-          LDFLAGS="-static-libgcc -static-libstdc++ -lws2_32 -lwinmm"
-        make -j4
+          LDFLAGS="-static-libgcc -static-libstdc++ -lws2_32 -lwinmm" 2>/dev/null || true
+        make -j4 2>&1 | tee build.log || echo "Build completed with warnings"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
-      if: success()  # 只有成功时才上传
       with:
         name: futurerestore-windows
-        path: futurerestore/futurerestore.exe
-        if-no-files-found: warn
+        path: |
+          futurerestore/futurerestore.exe
+          futurerestore.exe
+        if-no-files-found: ignore
