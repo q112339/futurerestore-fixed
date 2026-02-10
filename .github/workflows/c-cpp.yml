@@ -1,0 +1,3755 @@
+//
+//  futurerestore.cpp
+//  futurerestore
+//
+//  Created by tihmstar on 14.09.16.
+//  Copyright © 2016 tihmstar. All rights reserved.
+//
+
+#include <libgeneral/macros.h>
+#include <iostream>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <libgen.h>
+#include <zlib.h>
+#include "futurerestore.hpp"
+
+#ifdef HAVE_LIBIPATCHER
+#include <libipatcher/libipatcher.hpp>
+#endif
+
+#include <img4tool/img4tool.hpp>
+
+extern "C"{
+#include "common.h"
+#include "normal.h"
+#include "recovery.h"
+#include "dfu.h"
+#include "ipsw.h"
+#include "locking.h"
+#include "restore.h"
+#include "tsschecker.h"
+#include <libirecovery.h>
+}
+
+//(re)define __mkdir
+#ifdef __mkdir
+#undef __mkdir
+#endif
+#ifdef WIN32
+#include <windows.h>
+#define __mkdir(path, mode) mkdir(path)
+#else
+#include <sys/stat.h>
+#define __mkdir(path, mode) mkdir(path, mode)
+#endif
+
+#define USEC_PER_SEC 1000000
+
+#ifdef WIN32
+#define FUTURERESTORE_TMP_PATH "download"
+#else
+#define TMP_PATH "/tmp"
+#define FUTURERESTORE_TMP_PATH TMP_PATH"/futurerestore"
+#endif
+
+#define BASEBAND_TMP_PATH FUTURERESTORE_TMP_PATH"/baseband.bbfw"
+#define BASEBAND_MANIFEST_TMP_PATH FUTURERESTORE_TMP_PATH"/basebandManifest.plist"
+#define SEP_TMP_PATH FUTURERESTORE_TMP_PATH"/sep.im4p"
+#define SEP_MANIFEST_TMP_PATH FUTURERESTORE_TMP_PATH"/sepManifest.plist"
+#define FIRMWARES_TMP_PATH FUTURERESTORE_TMP_PATH"/Firmwares/"
+
+#ifdef __APPLE__
+#   include <CommonCrypto/CommonDigest.h>
+#   define SHA1(d, n, md) CC_SHA1(d, n, md)
+#   define SHA384(d, n, md) CC_SHA384(d, n, md)
+#else
+#   include <openssl/sha.h>
+#endif // __APPLE__
+
+#ifndef HAVE_LIBIPATCHER
+#define _enterPwnRecoveryRequested false
+#endif
+
+using namespace tihmstar;
+
+#pragma mark helpers
+extern "C"{
+    void irecv_event_cb(const irecv_device_event_t* event, void *userdata);
+    void idevice_event_cb(const idevice_event_t *event, void *userdata);
+};
+
+#pragma mark futurerestore
+futurerestore::futurerestore(bool isUpdateInstall, bool isPwnDfu) : _isUpdateInstall(isUpdateInstall), _isPwnDfu(isPwnDfu){
+    _client = idevicerestore_client_new();
+    if (_client == NULL) throw std::string("could not create idevicerestore client\n");
+    
+    struct stat st{0};
+    if (stat(FUTURERESTORE_TMP_PATH, &st) == -1) __mkdir(FUTURERESTORE_TMP_PATH, 0755);
+    
+    nocache = 1; //tsschecker nocache
+    _foundnonce = -1;
+}
+
+bool futurerestore::init(){
+    if (_didInit) return _didInit;
+    _didInit = (check_mode(_client) != MODE_UNKNOWN);
+    if (!(_client->image4supported = is_image4_supported(_client))){
+        info("[INFO] 32-bit device detected\n");
+    }else{
+        info("[INFO] 64-bit device detected\n");
+    }
+    return _didInit;
+}
+
+uint64_t futurerestore::getDeviceEcid(){
+    retassure(_didInit, "did not init\n");
+    uint64_t ecid;
+    get_ecid(_client, &ecid);
+    return ecid;
+}
+
+int futurerestore::getDeviceMode(bool reRequest){
+    retassure(_didInit, "did not init\n");
+    if (!reRequest && _client->mode && _client->mode->index != MODE_UNKNOWN) {
+        return _client->mode->index;
+    }else{
+        dfu_client_free(_client);
+        recovery_client_free(_client);
+        return check_mode(_client);
+    }
+}
+
+void futurerestore::putDeviceIntoRecovery(){
+    retassure(_didInit, "did not init\n");
+
+#ifdef HAVE_LIBIPATCHER
+    _enterPwnRecoveryRequested = _isPwnDfu;
+#endif
+    
+    getDeviceMode(false);
+    info("Found device in %s mode\n", _client->mode->string);
+    if (_client->mode->index == MODE_NORMAL){
+#ifdef HAVE_LIBIPATCHER
+        retassure(!_isPwnDfu, "isPwnDfu enabled, but device was found in normal mode\n");
+#endif
+        info("Entering recovery mode...\n");
+        retassure(!normal_enter_recovery(_client),"Unable to place device into recovery mode from %s mode\n", _client->mode->string);
+    }else if (_client->mode->index == MODE_RECOVERY){
+        info("Device already in recovery mode\n");
+    }else if (_client->mode->index == MODE_DFU && _isPwnDfu &&
+#ifdef HAVE_LIBIPATCHER
+              true
+#else
+              false
+#endif
+              ){
+        info("requesting to get into pwnRecovery later\n");
+    }else if (!_client->image4supported){
+        info("32-bit device in DFU mode found, assuming user wants to use iOS 9.x re-restore bug. Not failing here\n");
+    }else{
+        reterror("unsupported device mode, please put device in recovery or normal mode\n");
+    }
+    
+    safeFree(_client->udid); //only needs to be freed manually when function did't throw exception
+    
+    //these get also freed by destructor
+    dfu_client_free(_client);
+    recovery_client_free(_client);
+}
+
+void futurerestore::setAutoboot(bool val){
+    retassure(_didInit, "did not init\n");
+
+    retassure(getDeviceMode(false) == MODE_RECOVERY, "can't set auto-boot, when device isn't in recovery mode\n");
+    if(!_client->recovery){
+        retassure(!recovery_client_new(_client),"Could not connect to device in recovery mode.\n");
+    }
+    retassure(!recovery_set_autoboot(_client, val),"Setting auto-boot failed?!\n");
+}
+
+void futurerestore::exitRecovery(){
+    setAutoboot(true);
+    recovery_send_reset(_client);
+    recovery_client_free(_client);
+}
+
+plist_t futurerestore::nonceMatchesApTickets(){
+    retassure(_didInit, "did not init\n");
+
+    if (getDeviceMode(true) != MODE_RECOVERY){
+        if (getDeviceMode(false) != MODE_DFU || *_client->version != '9')
+            reterror("Device is not in recovery mode, can't check ApNonce\n");
+        else
+            _rerestoreiOS9 = (info("Detected iOS 9.x 32-bit re-restore, proceeding in DFU mode\n"),true);
+    }
+    
+    unsigned char* realnonce;
+    int realNonceSize = 0;
+    if (_rerestoreiOS9) {
+        info("Skipping ApNonce check\n");
+    }else{
+        recovery_get_ap_nonce(_client, &realnonce, &realNonceSize);
+        
+        info("Got ApNonce from device: ");
+        int i = 0;
+        for (i = 0; i < realNonceSize; i++) {
+            info("%02x ", ((unsigned char *)realnonce)[i]);
+        }
+        info("\n");
+    }
+    
+    vector<const char*>nonces;
+    
+    if (_client->image4supported){
+        for (int i=0; i< _im4ms.size(); i++){
+            auto nonce = img4tool::getValFromIM4M({_im4ms[i].first,_im4ms[i].second}, 'BNCH');
+            if (nonce.payloadSize() == realNonceSize && memcmp(realnonce, nonce.payload(), realNonceSize) == 0) return _aptickets[i];
+        }
+    }else{
+        for (int i=0; i< _im4ms.size(); i++){
+            size_t ticketNonceSize = 0;
+            const char *nonce = NULL;
+            try {
+                //nonce might not exist, which we use in re-restoring iOS 9.x for 32-bit
+                auto n = getNonceFromSCAB(_im4ms[i].first, _im4ms[i].second);
+                ticketNonceSize = n.second;
+                nonce = n.first;
+            } catch (...)
+            { }
+            if (memcmp(realnonce, nonce, ticketNonceSize) == 0 &&
+                 (  (ticketNonceSize == realNonceSize && realNonceSize+ticketNonceSize > 0) ||
+                        (!ticketNonceSize && *_client->version == '9' &&
+                            (getDeviceMode(false) == MODE_DFU ||
+                                ( getDeviceMode(false) == MODE_RECOVERY && !strncmp(getiBootBuild(), "iBoot-2817", strlen("iBoot-2817")) )
+                            )
+                         )
+                 )
+               )
+                //either nonce needs to match or using re-restore bug in iOS 9.x
+                return _aptickets[i];
+        }
+    }
+    
+    return NULL;
+}
+
+std::pair<const char *,size_t> futurerestore::nonceMatchesIM4Ms(){
+    retassure(_didInit, "did not init\n");
+
+    retassure(getDeviceMode(true) == MODE_RECOVERY, "Device is not in recovery mode, can't check ApNonce\n");
+    
+    unsigned char* realnonce;
+    int realNonceSize = 0;
+    recovery_get_ap_nonce(_client, &realnonce, &realNonceSize);
+    
+    vector<const char*>nonces;
+    
+    if (_client->image4supported) {
+        for (int i=0; i< _im4ms.size(); i++){
+            auto nonce = img4tool::getValFromIM4M({_im4ms[i].first,_im4ms[i].second}, 'BNCH');
+            if (nonce.payloadSize() == realNonceSize && memcmp(realnonce, nonce.payload(), realNonceSize) == 0) return _im4ms[i];
+        }
+    }else{
+        for (int i=0; i< _im4ms.size(); i++){
+            size_t ticketNonceSize = 0;
+            const char *nonce = NULL;
+            try {
+                //nonce might not exist, which we use in re-restoring iOS 9.x for 32-bit
+                auto n = getNonceFromSCAB(_im4ms[i].first, _im4ms[i].second);
+                ticketNonceSize = n.second;
+                nonce = n.first;
+            } catch (...) {
+                //
+            }
+            if (memcmp(realnonce, nonce, ticketNonceSize) == 0) return _im4ms[i];
+        }
+    }
+    
+    return {NULL,0};
+}
+
+void futurerestore::waitForNonce(vector<const char *>nonces, size_t nonceSize){
+    retassure(_didInit, "did not init\n");
+    setAutoboot(false);
+    
+    unsigned char* realnonce;
+    int realNonceSize = 0;
+    
+    for (auto nonce : nonces){
+        info("waiting for ApNonce: ");
+        int i = 0;
+        for (i = 0; i < nonceSize; i++) {
+            info("%02x ", ((unsigned char *)nonce)[i]);
+        }
+        info("\n");
+    }
+    
+    do {
+        if (realNonceSize){
+            recovery_send_reset(_client);
+            recovery_client_free(_client);
+            usleep(1*USEC_PER_SEC);
+        }
+        while (getDeviceMode(true) != MODE_RECOVERY) usleep(USEC_PER_SEC*0.5);
+        retassure(!recovery_client_new(_client), "Could not connect to device in recovery mode\n");
+        
+        recovery_get_ap_nonce(_client, &realnonce, &realNonceSize);
+        info("Got ApNonce from device: ");
+        int i = 0;
+        for (i = 0; i < realNonceSize; i++) {
+            info("%02x ", realnonce[i]);
+        }
+        info("\n");
+        for (int i=0; i<nonces.size(); i++){
+            if (memcmp(realnonce, (unsigned const char*)nonces[i], realNonceSize) == 0) _foundnonce = i;
+        }
+    } while (_foundnonce == -1);
+    info("Device has requested ApNonce now\n");
+    
+    setAutoboot(true);
+}
+
+void futurerestore::waitForNonce(){
+    retassure(_im4ms.size(), "No IM4M loaded\n");
+    
+    size_t nonceSize = 0;
+    vector<const char*>nonces;
+    
+    retassure(_client->image4supported, "Error: ApNonce collision function is not supported on 32-bit devices\n");
+    
+    for (auto im4m : _im4ms){
+        auto nonce = img4tool::getValFromIM4M({im4m.first,im4m.second}, 'BNCH');
+        if (!nonceSize) {
+            nonceSize = nonce.payloadSize();
+        }
+        retassure(nonceSize == nonce.payloadSize(), "Nonces have different lengths!");
+        nonces.push_back((const char*)nonce.payload());
+    }
+    
+    waitForNonce(nonces,nonceSize);
+}
+
+void futurerestore::loadAPTickets(const vector<const char *> &apticketPaths){
+    for (auto apticketPath : apticketPaths){
+        plist_t apticket = NULL;
+        char *im4m = NULL;
+        struct stat fst;
+        
+        retassure(!stat(apticketPath, &fst), "failed to load APTicket at %s\n",apticketPath);
+        
+        gzFile zf = gzopen(apticketPath, "rb");
+        if (zf) {
+            int blen = 0;
+            int readsize = 16384; //0x4000
+            int bufsize = readsize;
+            char* bin = (char*)malloc(bufsize);
+            char* p = bin;
+            do {
+                int bytes_read = gzread(zf, p, readsize);
+                retassure(bytes_read>0, "Error reading gz compressed data\n");
+                blen += bytes_read;
+                if (bytes_read < readsize) {
+                    if (gzeof(zf)) {
+                        bufsize += bytes_read;
+                        break;
+                    }
+                }
+                bufsize += readsize;
+                bin = (char*)realloc(bin, bufsize);
+                p = bin + blen;
+            } while (!gzeof(zf));
+            gzclose(zf);
+            if (blen > 0) {
+                if (memcmp(bin, "bplist00", 8) == 0)
+                    plist_from_bin(bin, blen, &apticket);
+                else
+                    plist_from_xml(bin, blen, &apticket);
+            }
+            free(bin);
+        }
+        
+        if (_isUpdateInstall) {
+            if(plist_t update =  plist_dict_get_item(apticket, "updateInstall")){
+                plist_t cpy = plist_copy(update);
+                plist_free(apticket);
+                apticket = cpy;
+            }
+        }
+        
+        plist_t ticket = plist_dict_get_item(apticket, (_client->image4supported) ? "ApImg4Ticket" : "APTicket");
+        uint64_t im4msize=0;
+        plist_get_data_val(ticket, &im4m, &im4msize);
+        
+        retassure(im4msize, "Error: failed to load signing ticket file %s\n",apticketPath);
+        
+        _im4ms.push_back({im4m,im4msize});
+        _aptickets.push_back(apticket);
+        printf("reading signing ticket %s is done\n",apticketPath);
+    }
+}
+
+uint64_t futurerestore::getBasebandGoldCertIDFromDevice(){
+    if (!_client->preflight_info){
+        if (normal_get_preflight_info(_client, &_client->preflight_info) == -1){
+            printf("[WARNING] failed to read BasebandGoldCertID from device! Is it already in recovery?\n");
+            return 0;
+        }
+    }
+    plist_t node;
+    node = plist_dict_get_item(_client->preflight_info, "CertID");
+    if (!node || plist_get_node_type(node) != PLIST_UINT) {
+        error("Unable to find required BbGoldCertId in parameters\n");
+        return 0;
+    }
+    uint64_t val = 0;
+    plist_get_uint_val(node, &val);
+    return val;
+}
+
+char *futurerestore::getiBootBuild(){
+    if (!_ibootBuild){
+        if (_client->recovery == NULL) {
+            retassure(!recovery_client_new(_client), "Error: can't create new recovery client");
+        }
+        irecv_getenv(_client->recovery->client, "build-version", &_ibootBuild);
+        retassure(_ibootBuild, "Error: can't get a build-version");
+    }
+    return _ibootBuild;
+}
+
+pair<ptr_smart<char*>, size_t> getIPSWComponent(struct idevicerestore_client_t* client, plist_t build_identity, string component){
+    ptr_smart<char *> path;
+    unsigned char* component_data = NULL;
+    unsigned int component_size = 0;
+
+    if (!(char*)path) {
+        retassure(!build_identity_get_component_path(build_identity, component.c_str(), &path),"ERROR: Unable to get path for component '%s'\n", component.c_str());
+    }
+    
+    retassure(!extract_component(client->ipsw, (char*)path, &component_data, &component_size),"ERROR: Unable to extract component: %s\n", component.c_str());
+    
+    return {(char*)component_data,component_size};
+}
+
+void futurerestore::enterPwnRecovery(plist_t build_identity, string bootargs){
+#ifndef HAVE_LIBIPATCHER
+    reterror("compiled without libipatcher");
+#else
+    if (_client->image4supported) {
+        retassure(libipatcher::has64bitSupport(), "libipatcher was compiled without 64-bit support");
+        std::string generator = getGeneratorFromSHSH2(_client->tss);
+        retassure(img4tool::isGeneratorValidForIM4M({_im4ms[0].first,_im4ms[0].second}, generator), "generator returned from device is not valid from APTicket");
+    }
+    
+    int mode = 0;
+    libipatcher::fw_key iBSSKeys;
+    libipatcher::fw_key iBECKeys;
+    
+    retassure(!dfu_client_new(_client),"Unable to connect to DFU device\n");
+
+    irecv_get_mode(_client->dfu->client, &mode);
+        
+    try {
+        iBSSKeys = libipatcher::getFirmwareKey(_client->device->product_type, _client->build, "iBSS");
+        iBECKeys = libipatcher::getFirmwareKey(_client->device->product_type, _client->build, "iBEC");
+    } catch (tihmstar::exception &e) {
+        reterror("getting keys failed with error: %d (%s). Are keys publicly available?",e.code(),e.what());
+    }
+    
+    auto iBSS = getIPSWComponent(_client, build_identity, "iBSS");
+    iBSS = move(libipatcher::patchiBSS((char*)iBSS.first, iBSS.second, iBSSKeys));
+    
+    auto iBEC = getIPSWComponent(_client, build_identity, "iBEC");
+    iBEC = move(libipatcher::patchiBEC((char*)iBEC.first, iBEC.second, iBECKeys, bootargs));
+        
+    if (_client->image4supported) {
+        /* if this is 64-bit, we need to back IM4P to IMG4
+           also due to the nature of iBoot64Patchers sigpatches we need to stich a valid signed im4m to it (but nonce is ignored) */
+        iBSS = move(libipatcher::packIM4PToIMG4(iBSS.first, iBSS.second, _im4ms[0].first, _im4ms[0].second));
+        iBEC = move(libipatcher::packIM4PToIMG4(iBEC.first, iBEC.second, _im4ms[0].first, _im4ms[0].second));
+    }
+    
+    bool modeIsRecovery = false;
+    if (mode != IRECV_K_DFU_MODE) {
+        info("NOTE: device is not in DFU mode, assuming pwn recovery mode.\n");
+        for (int i=IRECV_K_RECOVERY_MODE_1; i<=IRECV_K_RECOVERY_MODE_4; i++) {
+            if (mode == i)
+                modeIsRecovery = true;
+        }
+        retassure(modeIsRecovery, "device is not in recovery mode\n");
+    }else{
+        info("Sending %s (%lu bytes)...\n", "iBSS", iBSS.second);
+        mutex_lock(&_client->device_event_mutex);
+        irecv_error_t err = irecv_send_buffer(_client->dfu->client, (unsigned char*)(char*)iBSS.first, (unsigned long)iBSS.second, 1);
+        retassure(err == IRECV_E_SUCCESS,"ERROR: Unable to send %s component: %s\n", "iBSS", irecv_strerror(err));
+        
+        /* reconnect */
+        dfu_client_free(_client);
+        
+        debug("Waiting for device to disconnect...\n");
+        cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+        retassure((_client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBSS. Reset device and try again");
+        mutex_unlock(&_client->device_event_mutex);
+
+        debug("Waiting for device to reconnect...\n");
+        mutex_lock(&_client->device_event_mutex);
+        cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+        retassure((_client->mode == &idevicerestore_modes[MODE_DFU] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBSS. Reset device and try again");
+        mutex_unlock(&_client->device_event_mutex);
+        
+        dfu_client_new(_client);
+    }
+    
+    if (_client->build_major > 8) {
+        retassure(!irecv_usb_set_configuration(_client->dfu->client, 1),"ERROR: set configuration failed\n");
+        /* send iBEC */
+        info("Sending %s (%lu bytes)...\n", "iBEC", iBEC.second);
+        mutex_lock(&_client->device_event_mutex);
+        irecv_error_t err = irecv_send_buffer(_client->dfu->client, (unsigned char*)(char*)iBEC.first, (unsigned long)iBEC.second, 1);
+        retassure(err == IRECV_E_SUCCESS,"ERROR: Unable to send %s component: %s\n", "iBEC", irecv_strerror(err));
+        printf("waiting for device to reconnect...\n");
+        if (modeIsRecovery){
+            irecv_send_command(_client->dfu->client, "go");
+            recovery_client_free(_client);
+        }else{
+            dfu_client_free(_client);
+        }
+
+        debug("Waiting for device to disconnect...\n");
+        cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+        /* retassure((_client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBEC. Reset device and try again"); */
+        mutex_unlock(&_client->device_event_mutex);
+    }
+
+    debug("Waiting for device to reconnect...\n");
+    mutex_lock(&_client->device_event_mutex);
+    cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+    retassure((_client->mode == &idevicerestore_modes[MODE_RECOVERY] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not reconnect. Possibly invalid iBEC. Reset device and try again");
+    mutex_unlock(&_client->device_event_mutex);
+    
+    // Reconnect to device, but this time make sure we're not still in DFU mode
+    if (recovery_client_new(_client) < 0) {
+        if (_client->recovery->client) {
+            irecv_close(_client->recovery->client);
+            _client->recovery->client = NULL;
+        }
+        reterror("ERROR: Unable to connect to recovery device\n");
+    }
+    
+    if (_client->image4supported) {
+        char *deviceGen = NULL;
+        cleanup([&]{
+            safeFree(deviceGen);
+        });
+        /* IMG4 requires to have a generator set for the device to successfully boot after restore
+           set generator now and make sure the nonce is the one we are trying to restore */
+        
+        assure(!irecv_send_command(_client->recovery->client, "bgcolor 255 0 0"));
+        sleep(2); //yes, I like displaying colored screens to the user and making him wait for no reason :P
+        
+        auto nonceelem = img4tool::getValFromIM4M({_im4ms[0].first,_im4ms[0].second}, 'BNCH');
+
+        printf("ApNonce pre-hax:\n");
+        get_ap_nonce(_client, &_client->nonce, &_client->nonce_size);
+        std::string generator = getGeneratorFromSHSH2(_client->tss);
+
+        if (memcmp(_client->nonce, nonceelem.payload(), _client->nonce_size) != 0) {
+            printf("ApNonce from device doesn't match IM4M nonce, applying hax...\n");
+            
+            assure(_client->tss);
+            printf("Writing generator=%s to nvram!\n",generator.c_str());
+            
+            retassure(!irecv_setenv(_client->recovery->client, "com.apple.System.boot-nonce", generator.c_str()),"failed to write generator to nvram");
+            retassure(!irecv_saveenv(_client->recovery->client), "failed to save nvram");
+            
+            /* send iBEC */
+            info("Sending %s (%lu bytes)...\n", "iBEC", iBEC.second);
+            mutex_lock(&_client->device_event_mutex);
+            irecv_error_t err = irecv_send_buffer(_client->recovery->client, (unsigned char*)(char*)iBEC.first, (unsigned long)iBEC.second, 1);
+            retassure(err == IRECV_E_SUCCESS,"ERROR: Unable to send %s component: %s\n", "iBEC", irecv_strerror(err));
+            printf("waiting for device to reconnect...\n");
+            retassure(!irecv_send_command(_client->recovery->client, "go"),"failed to re-launch iBEC after ApNonce hax");
+            recovery_client_free(_client);
+
+            debug("Waiting for device to disconnect...\n");
+            cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+            retassure((_client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not disconnect after sending hax-iBEC in pwn-iBEC mode");
+            mutex_unlock(&_client->device_event_mutex);
+            
+            debug("Waiting for device to reconnect...\n");
+            mutex_lock(&_client->device_event_mutex);
+            cond_wait_timeout(&_client->device_event_cond, &_client->device_event_mutex, 10000);
+            retassure((_client->mode == &idevicerestore_modes[MODE_RECOVERY] || (mutex_unlock(&_client->device_event_mutex),0)), "Device did not reconnect after sending hax-iBEC in pwn-iBEC mode");
+            mutex_unlock(&_client->device_event_mutex);
+
+            retassure(!recovery_client_new(_client), "failed to reconnect to recovery after ApNonce hax");
+            
+            printf("APnonce post-hax:\n");
+            get_ap_nonce(_client, &_client->nonce, &_client->nonce_size);
+            assure(!irecv_send_command(_client->recovery->client, "bgcolor 255 255 0"));
+            retassure(memcmp(_client->nonce, nonceelem.payload(), _client->nonce_size) == 0, "ApNonce from device doesn't match IM4M nonce after applying ApNonce hax. Aborting!");
+        }else{
+            printf("APNonce from device already matches IM4M nonce, no need for extra hax...\n");
+        }
+        retassure(!irecv_setenv(_client->recovery->client, "com.apple.System.boot-nonce", generator.c_str()),"failed to write generator to nvram");
+        retassure(!irecv_saveenv(_client->recovery->client), "failed to save nvram");
+        
+        sleep(2); //yes, I like displaying colored screens to the user and making him wait for no reason :P
+    }
+    
+#endif //HAVE_LIBIPATCHER
+}
+
+void get_custom_component(struct idevicerestore_client_t* client, plist_t build_identity, const char* component, unsigned char** data, unsigned int *size){
+#ifndef HAVE_LIBIPATCHER
+    reterror("compiled without libipatcher");
+#else
+    try {
+        auto comp = getIPSWComponent(client, build_identity, component);
+        comp = move(libipatcher::decryptFile3((char*)comp.first, comp.second, libipatcher::getFirmwareKey(client->device->product_type, client->build, component)));
+        *data = (unsigned char*)(char*)comp.first;
+        *size = comp.second;
+        comp.first = NULL; //don't free on destruction
+    } catch (tihmstar::exception &e) {
+        reterror("ERROR: libipatcher failed with reason %d (%s)\n",e.code(),e.what());
+    }
+    
+#endif
+}
+
+void futurerestore::doRestore(const char *ipsw){
+    plist_t buildmanifest = NULL;
+    int delete_fs = 0;
+    char* filesystem = NULL;
+    cleanup([&]{
+        info("Cleaning up...\n");
+        safeFreeCustom(buildmanifest, plist_free);
+        if (delete_fs && filesystem) unlink(filesystem);
+    });
+    struct idevicerestore_client_t* client = _client;
+    plist_t build_identity = NULL;
+    plist_t sep_build_identity = NULL;
+
+    client->ipsw = strdup(ipsw);
+    if (!_isUpdateInstall) client->flags |= FLAG_ERASE;
+    
+    irecv_device_event_subscribe(&client->irecv_e_ctx, irecv_event_cb, client);
+    idevice_event_subscribe(idevice_event_cb, client);
+    client->idevice_e_ctx = (void*)idevice_event_cb;
+
+    mutex_lock(&client->device_event_mutex);
+    cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+    
+    retassure(client->mode != &idevicerestore_modes[MODE_UNKNOWN],  "Unable to discover device mode. Please make sure a device is attached.\n");
+    if (client->mode != &idevicerestore_modes[MODE_RECOVERY]) {
+        retassure(client->mode == &idevicerestore_modes[MODE_DFU], "Device is in unexpected mode detected!");
+        retassure(_enterPwnRecoveryRequested, "Device is in DFU mode detected, but we were expecting recovery mode!");
+    }else{
+        retassure(!_enterPwnRecoveryRequested, "--use-pwndfu was specified, but device found in recovery mode!");
+    }
+        
+    info("Found device in %s mode\n", client->mode->string);
+    mutex_unlock(&client->device_event_mutex);
+
+    info("Identified device as %s, %s\n", getDeviceBoardNoCopy(), getDeviceModelNoCopy());
+
+    retassure(!access(client->ipsw, F_OK),"ERROR: Firmware file %s does not exist.\n", client->ipsw); // verify if ipsw file exists
+
+    info("Extracting BuildManifest from iPSW\n");
+    {
+        int unused;
+        retassure(!ipsw_extract_build_manifest(client->ipsw, &buildmanifest, &unused),"ERROR: Unable to extract BuildManifest from %s. Firmware file might be corrupt.\n", client->ipsw);
+    }
+
+    /* check if device type is supported by the given build manifest */
+    retassure(!build_manifest_check_compatibility(buildmanifest, client->device->product_type),"ERROR: Could not make sure this firmware is suitable for the current device. Refusing to continue.\n");
+    
+    /* print iOS information from the manifest */
+    build_manifest_get_version_information(buildmanifest, client);
+    info("Product version: %s\n", client->version);
+    info("Product build: %s Major: %d\n", client->build, client->build_major);
+    client->image4supported = is_image4_supported(client);
+    info("Device supports Image4: %s\n", (client->image4supported) ? "true" : "false");
+    
+    if (_enterPwnRecoveryRequested) //we are in pwnDFU, so we don't need to check nonces
+        client->tss = _aptickets.at(0);
+    else if (!(client->tss = nonceMatchesApTickets()))
+        reterror("Device ApNonce does not match APTicket nonce\n");
+
+    plist_dict_remove_item(client->tss, "BBTicket");
+    plist_dict_remove_item(client->tss, "BasebandFirmware");
+
+    if (_enterPwnRecoveryRequested && _client->image4supported) {
+        retassure(plist_dict_get_item(_client->tss, "generator"), "signing ticket file does not contain generator. But a generator is required for 64-bit pwnDFU restore");
+    }
+    
+    retassure(build_identity = getBuildidentityWithBoardconfig(buildmanifest, client->device->hardware_model, _isUpdateInstall),"ERROR: Unable to find any build identities for iPSW\n");
+
+    if (_client->image4supported) {
+        if (!(sep_build_identity = getBuildidentityWithBoardconfig(_sepbuildmanifest, client->device->hardware_model, _isUpdateInstall))){
+            retassure(_isPwnDfu, "ERROR: Unable to find any build identities for SEP\n");
+            warning("can't find buildidentity for SEP with InstallType=%s. However pwnDFU was requested, so trying fallback to %s",(_isUpdateInstall ? "UPDATE" : "ERASE"),(!_isUpdateInstall ? "UPDATE" : "ERASE"));
+            retassure((sep_build_identity = getBuildidentityWithBoardconfig(_sepbuildmanifest, client->device->hardware_model, !_isUpdateInstall)),
+                      "ERROR: Unable to find any build identities for SEP\n");
+        }
+    }
+
+    plist_t manifest = plist_dict_get_item(build_identity, "Manifest"); //this is the buildidentity used for restore
+
+    printf("checking APTicket to be valid for this restore...\n"); //if we are in pwnDFU, just use first APTicket. We don't need to check nonces.
+    auto im4m = (_enterPwnRecoveryRequested || _rerestoreiOS9) ? _im4ms.at(0) : nonceMatchesIM4Ms();
+
+    uint64_t deviceEcid = getDeviceEcid();
+    uint64_t im4mEcid = 0;
+    if (_client->image4supported) {
+        auto ecid = img4tool::getValFromIM4M({im4m.first,im4m.second}, 'ECID');
+        im4mEcid = ecid.getIntegerValue();
+    }else{
+        im4mEcid = getEcidFromSCAB(im4m.first, im4m.second);
+    }
+
+    retassure(im4mEcid, "Failed to read ECID from APTicket\n");
+
+    if (im4mEcid != deviceEcid) {
+        error("ECID inside APTicket does not match device ECID\n");
+        printf("APTicket is valid for %16llu (dec) but device is %16llu (dec)\n",im4mEcid,deviceEcid);
+        reterror("APTicket can't be used for restoring this device\n");
+    }else
+        printf("Verified ECID in APTicket matches device ECID\n");
+
+    if (_client->image4supported) {
+        printf("checking APTicket to be valid for this restore...\n");
+        uint64_t deviceEcid = getDeviceEcid();
+
+        if (im4mEcid != deviceEcid) {
+            error("ECID inside APTicket does not match device ECID\n");
+            printf("APTicket is valid for %16llu (dec) but device is %16llu (dec)\n",im4mEcid,deviceEcid);
+            reterror("APTicket can't be used for restoring this device\n");
+        }else
+            printf("Verified ECID in APTicket matches device ECID\n");
+
+        plist_t ticketIdentity = NULL;
+        
+        try {
+            ticketIdentity = img4tool::getBuildIdentityForIm4m({im4m.first,im4m.second}, buildmanifest);
+        } catch (tihmstar::exception &e) {
+            //
+        }
+        
+        if (!ticketIdentity) {
+            printf("Failed to get exact match for build identity, using fallback to ignore certain values\n");
+            ticketIdentity = img4tool::getBuildIdentityForIm4m({im4m.first,im4m.second}, buildmanifest, {"RestoreRamDisk","RestoreTrustCache"});
+        }
+
+        /* TODO: make this nicer!
+           for now a simple pointercompare should be fine, because both plist_t should point into the same buildidentity inside the buildmanifest */
+        if (ticketIdentity != build_identity ){
+            error("BuildIdentity selected for restore does not match APTicket\n\n");
+            printf("BuildIdentity selected for restore:\n");
+            img4tool::printGeneralBuildIdentityInformation(build_identity);
+            printf("\nBuildIdentity is valid for the APTicket:\n");
+
+            if (ticketIdentity) img4tool::printGeneralBuildIdentityInformation(ticketIdentity),putchar('\n');
+            else{
+                printf("IM4M is not valid for any restore within the Buildmanifest\n");
+                printf("This APTicket can't be used for restoring this firmware\n");
+            }
+            reterror("APTicket can't be used for this restore\n");
+        }else{
+            if (!img4tool::isIM4MSignatureValid({im4m.first,im4m.second})){
+                printf("IM4M signature is not valid!\n");
+                reterror("APTicket can't be used for this restore\n");
+            }
+            printf("Verified APTicket to be valid for this restore\n");
+        }
+    }else if (_enterPwnRecoveryRequested){
+        info("[WARNING] skipping ramdisk hash check, since device is in pwnDFU according to user\n");
+
+    }else{
+        info("[WARNING] full buildidentity check is not implemented, only comparing ramdisk hash.\n");
+
+        auto ticket = getRamdiskHashFromSCAB(im4m.first, im4m.second);
+        const char *tickethash = ticket.first;
+        size_t tickethashSize = ticket.second;
+
+        uint64_t manifestDigestSize = 0;
+        char *manifestDigest = NULL;
+
+        plist_t restoreRamdisk = plist_dict_get_item(manifest, "RestoreRamDisk");
+        plist_t digest = plist_dict_get_item(restoreRamdisk, "Digest");
+
+        plist_get_data_val(digest, &manifestDigest, &manifestDigestSize);
+
+        if (tickethashSize == manifestDigestSize && memcmp(tickethash, manifestDigest, tickethashSize) == 0){
+            printf("Verified APTicket to be valid for this restore\n");
+            free(manifestDigest);
+        }else{
+            free(manifestDigest);
+            printf("APTicket ramdisk hash does not match the ramdisk we are trying to boot. Are you using correct install type (Update/Erase)?\n");
+            reterror("APTicket can't be used for this restore\n");
+        }
+    }
+
+    if (_basebandbuildmanifest){
+        if (!(client->basebandBuildIdentity = getBuildidentityWithBoardconfig(_basebandbuildmanifest, client->device->hardware_model, _isUpdateInstall))){
+            retassure(client->basebandBuildIdentity = getBuildidentityWithBoardconfig(_basebandbuildmanifest, client->device->hardware_model, !_isUpdateInstall), "ERROR: Unable to find any build identities for Baseband\n");
+            info("[WARNING] Unable to find Baseband buildidentities for restore type %s, using fallback %s\n", (_isUpdateInstall) ? "Update" : "Erase",(!_isUpdateInstall) ? "Update" : "Erase");
+        }
+
+        client->bbfwtmp = (char*)_basebandPath;
+
+        plist_t bb_manifest = plist_dict_get_item(client->basebandBuildIdentity, "Manifest");
+        plist_t bb_baseband = plist_copy(plist_dict_get_item(bb_manifest, "BasebandFirmware"));
+        plist_dict_set_item(manifest, "BasebandFirmware", bb_baseband);
+
+        retassure(_client->basebandBuildIdentity, "BasebandBuildIdentity not loaded, refusing to continue");
+    }else{
+        warning("WARNING: we don't have a basebandbuildmanifest, does not flashing baseband!\n");
+    }
+
+    if (_client->image4supported) {
+        //check SEP
+        plist_t sep_manifest = plist_dict_get_item(sep_build_identity, "Manifest");
+        plist_t sep_sep = plist_copy(plist_dict_get_item(sep_manifest, "SEP"));
+        plist_dict_set_item(manifest, "SEP", sep_sep);
+        unsigned char genHash[48]; //SHA384 digest length
+        ptr_smart<unsigned char *>sephash = NULL;
+        uint64_t sephashlen = 0;
+        plist_t digest = plist_dict_get_item(sep_sep, "Digest");
+
+        retassure(digest && plist_get_node_type(digest) == PLIST_DATA, "ERROR: can't find SEP digest\n");
+
+        plist_get_data_val(digest, reinterpret_cast<char **>(&sephash), &sephashlen);
+
+        if (sephashlen == 20)
+            SHA1((unsigned char*)_client->sepfwdata, (unsigned int)_client->sepfwdatasize, genHash);
+        else
+            SHA384((unsigned char*)_client->sepfwdata, (unsigned int)_client->sepfwdatasize, genHash);
+        retassure(!memcmp(genHash, sephash, sephashlen), "ERROR: SEP does not match sepmanifest\n");
+    }
+
+    build_identity_print_information(build_identity); // print information about current build identity
+
+    //check for enterpwnrecovery, because we could be in DFU mode
+    if (_enterPwnRecoveryRequested){
+        retassure(getDeviceMode(true) == MODE_DFU, "unexpected device mode\n");
+        enterPwnRecovery(build_identity);
+    }
+    
+    // Get filesystem name from build identity
+    char* fsname = NULL;
+    retassure(!build_identity_get_component_path(build_identity, "OS", &fsname), "ERROR: Unable to get path for filesystem component\n");
+
+    // check if we already have an extracted filesystem
+    struct stat st;
+    memset(&st, '\0', sizeof(struct stat));
+    char tmpf[1024];
+    if (client->cache_dir) {
+        if (stat(client->cache_dir, &st) < 0) {
+            mkdir_with_parents(client->cache_dir, 0755);
+        }
+        strcpy(tmpf, client->cache_dir);
+        strcat(tmpf, "/");
+        char *ipswtmp = strdup(client->ipsw);
+        strcat(tmpf, basename(ipswtmp));
+        free(ipswtmp);
+    } else {
+        strcpy(tmpf, client->ipsw);
+    }
+    char* p = strrchr(tmpf, '.');
+    if (p) {
+        *p = '\0';
+    }
+
+    if (stat(tmpf, &st) < 0) {
+        __mkdir(tmpf, 0755);
+    }
+    strcat(tmpf, "/");
+    strcat(tmpf, fsname);
+
+    memset(&st, '\0', sizeof(struct stat));
+    if (stat(tmpf, &st) == 0) {
+        off_t fssize = 0;
+        ipsw_get_file_size(client->ipsw, fsname, (uint64_t*)&fssize);
+        if ((fssize > 0) && (st.st_size == fssize)) {
+            info("Using cached filesystem from '%s'\n", tmpf);
+            filesystem = strdup(tmpf);
+        }
+    }
+
+    if (!filesystem) {
+        char extfn[1024];
+        strcpy(extfn, tmpf);
+        strcat(extfn, ".extract");
+        char lockfn[1024];
+        strcpy(lockfn, tmpf);
+        strcat(lockfn, ".lock");
+        lock_info_t li;
+
+        lock_file(lockfn, &li);
+        FILE* extf = NULL;
+        if (access(extfn, F_OK) != 0) {
+            extf = fopen(extfn, "w");
+        }
+        unlock_file(&li);
+        if (!extf) {
+            // use temp filename
+            filesystem = tempnam(NULL, "ipsw_");
+            if (!filesystem) {
+                error("WARNING: Could not get temporary filename, using '%s' in current directory\n", fsname);
+                filesystem = strdup(fsname);
+            }
+            delete_fs = 1;
+        } else {
+            // use <fsname>.extract as filename
+            filesystem = strdup(extfn);
+            fclose(extf);
+        }
+        remove(lockfn);
+
+        info("Extracting filesystem from iPSW\n");
+        retassure(!ipsw_extract_to_file_with_progress(client->ipsw, fsname, filesystem, 1),"ERROR: Unable to extract filesystem from iPSW\n");
+
+        // rename <fsname>.extract to <fsname>
+        if (strstr(filesystem, ".extract")) {
+            remove(tmpf);
+            rename(filesystem, tmpf);
+            free(filesystem);
+            filesystem = strdup(tmpf);
+        }
+    }
+
+    if (_rerestoreiOS9) {
+        mutex_lock(&_client->device_event_mutex);
+        if (dfu_send_component(client, build_identity, "iBSS") < 0) {
+            irecv_close(client->dfu->client);
+            client->dfu->client = NULL;
+            reterror("ERROR: Unable to send iBSS to device\n");
+        }
+
+        /* reconnect */
+        dfu_client_free(client);
+        
+        debug("Waiting for device to disconnect...\n");
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        retassure((client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBSS. Reset device and try again");
+        mutex_unlock(&client->device_event_mutex);
+
+        debug("Waiting for device to reconnect...\n");
+        mutex_lock(&_client->device_event_mutex);
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        retassure((client->mode == &idevicerestore_modes[MODE_DFU] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBSS. Reset device and try again");
+        mutex_unlock(&client->device_event_mutex);
+        
+        dfu_client_new(client);
+
+        /* send iBEC */
+        if (dfu_send_component(client, build_identity, "iBEC") < 0) {
+            irecv_close(client->dfu->client);
+            client->dfu->client = NULL;
+            reterror("ERROR: Unable to send iBEC to device\n");
+        }
+        
+        dfu_client_free(client);
+        
+        debug("Waiting for device to disconnect...\n");
+        mutex_lock(&_client->device_event_mutex);
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        /* retassure((client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBEC. Reset device and try again"); */
+        mutex_unlock(&client->device_event_mutex);
+
+        debug("Waiting for device to reconnect...\n");
+        mutex_lock(&_client->device_event_mutex);
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        retassure((client->mode == &idevicerestore_modes[MODE_RECOVERY] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not reconnect. Possibly invalid iBEC. Reset device and try again");
+        mutex_unlock(&client->device_event_mutex);
+
+    }else{
+        if ((client->build_major > 8)) {
+            if (!client->image4supported) {
+                /* send APTicket */
+                if (recovery_send_ticket(client) < 0) {
+                    error("WARNING: Unable to send APTicket\n");
+                }
+            }
+        }
+    }
+
+    if (_enterPwnRecoveryRequested){
+        if (!_client->image4supported) {
+            if (strncmp(client->version, "10.", 3))//if pwnrecovery send all components decrypted, unless we're dealing with iOS 10
+                client->recovery_custom_component_function = get_custom_component;
+        }
+    }else if (!_rerestoreiOS9){
+        /* now we load the iBEC */
+        retassure(!recovery_send_ibec(client, build_identity),"ERROR: Unable to send iBEC\n");
+
+        printf("waiting for device to reconnect... ");
+        recovery_client_free(client);
+        
+        debug("Waiting for device to disconnect...\n");
+        mutex_unlock(&client->device_event_mutex);
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        /* retassure((client->mode == &idevicerestore_modes[MODE_UNKNOWN] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBEC. Reset device and try again"); */
+        mutex_unlock(&client->device_event_mutex);
+
+        debug("Waiting for device to reconnect...\n");
+        mutex_unlock(&client->device_event_mutex);
+        cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+        /* retassure((client->mode == &idevicerestore_modes[MODE_RECOVERY] || (mutex_unlock(&client->device_event_mutex),0)), "Device did not disconnect. Possibly invalid iBEC. Reset device and try again"); */
+        mutex_unlock(&client->device_event_mutex);
+    }
+
+    retassure(client->mode == &idevicerestore_modes[MODE_RECOVERY], "failed to reconnect to device in recovery (iBEC) mode\n");
+
+    //do magic
+    if (_client->image4supported) get_sep_nonce(client, &client->sepnonce, &client->sepnonce_size);
+    get_ap_nonce(client, &client->nonce, &client->nonce_size);
+    get_ecid(client, &client->ecid);
+
+    if (client->mode->index == MODE_RECOVERY) {
+        retassure(client->srnm,"ERROR: could not retrieve device serial number. Can't continue.\n");
+
+        retassure(!irecv_send_command(client->recovery->client, "bgcolor 0 255 0"), "ERROR: Unable to set bgcolor\n");
+        info("[WARNING] Setting bgcolor to green! If you don't see a green screen, then your device didn't boot iBEC correctly\n");
+        sleep(2); //show the user a green screen!
+
+        retassure(!recovery_enter_restore(client, build_identity),"ERROR: Unable to place device into restore mode\n");
+
+        recovery_client_free(client);
+    }
+
+    if (_client->image4supported) {
+        info("getting SEP ticket\n");
+        retassure(!get_tss_response(client, sep_build_identity, &client->septss), "ERROR: Unable to get signing tickets for SEP\n");
+        retassure(_client->sepfwdatasize && _client->sepfwdata, "SEP is not loaded, refusing to continue");
+    }
+    
+    mutex_lock(&client->device_event_mutex);
+    debug("Waiting for device to enter restore mode...\n");
+    cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 180000);
+    retassure((client->mode == &idevicerestore_modes[MODE_RESTORE] || (mutex_unlock(&client->device_event_mutex),0)), "Device can't enter to restore mode");
+    mutex_unlock(&client->device_event_mutex);
+
+    info("About to restore device... \n");
+    int result = 0;
+    retassure(!(result = restore_device(client, build_identity, filesystem)), "ERROR: Unable to restore device\n");
+}
+
+int futurerestore::doJustBoot(const char *ipsw, string bootargs){
+    reterror("not implemented");
+//    int err = 0;
+//    //some memory might not get freed if this function throws an exception, but you probably don't want to catch that anyway.
+//
+//    struct idevicerestore_client_t* client = _client;
+//    int unused;
+//    int result = 0;
+//    plist_t buildmanifest = NULL;
+//    plist_t build_identity = NULL;
+//
+//    client->ipsw = strdup(ipsw);
+//
+//    getDeviceMode(true);
+//    info("Found device in %s mode\n", client->mode->string);
+//
+//    retassure((client->mode->index == MODE_DFU || client->mode->index == MODE_RECOVERY) && _enterPwnRecoveryRequested, "device not in DFU/Recovery mode\n");
+//
+//    // discover the device type
+//    retassure(check_hardware_model(client) && client->device,"ERROR: Unable to discover device model\n");
+//    info("Identified device as %s, %s\n", client->device->hardware_model, client->device->product_type);
+//
+//    // verify if ipsw file exists
+//    retassure(!access(client->ipsw, F_OK), "ERROR: Firmware file %s does not exist.\n", client->ipsw);
+//    info("Extracting BuildManifest from IPSW\n");
+//
+//    retassure(!ipsw_extract_build_manifest(client->ipsw, &buildmanifest, &unused),"ERROR: Unable to extract BuildManifest from %s. Firmware file might be corrupt.\n", client->ipsw);
+//
+//    /* check if device type is supported by the given build manifest */
+//    retassure(!build_manifest_check_compatibility(buildmanifest, client->device->product_type),"ERROR: Could not make sure this firmware is suitable for the current device. Refusing to continue.\n");
+//
+//    /* print iOS information from the manifest */
+//    build_manifest_get_version_information(buildmanifest, client);
+//
+//    info("Product Version: %s\n", client->version);
+//    info("Product Build: %s Major: %d\n", client->build, client->build_major);
+//
+//    client->image4supported = is_image4_supported(client);
+//    info("Device supports Image4: %s\n", (client->image4supported) ? "true" : "false");
+//
+//    retassure(build_identity = getBuildidentityWithBoardconfig(buildmanifest, client->device->hardware_model, 0),"ERROR: Unable to find any build identities for IPSW\n");
+//
+//    /* print information about current build identity */
+//    build_identity_print_information(build_identity);
+//
+//    //check for enterpwnrecovery, because we could be in DFU mode
+//    retassure(_enterPwnRecoveryRequested, "enterPwnRecoveryRequested is not set, but required");
+//
+//    retassure(getDeviceMode(true) == MODE_DFU || getDeviceMode(false) == MODE_RECOVERY, "unexpected device mode\n");
+//
+//    enterPwnRecovery(build_identity, bootargs);
+//
+//    client->recovery_custom_component_function = get_custom_component;
+//
+//    for (int i=0;getDeviceMode(true) != MODE_RECOVERY && i<40; i++) putchar('.'),usleep(USEC_PER_SEC*0.5);
+//    putchar('\n');
+//
+//    retassure(check_mode(client), "failed to reconnect to device in recovery (iBEC) mode\n");
+//
+//    get_ecid(client, &client->ecid);
+//
+//    client->flags |= FLAG_BOOT;
+//
+//    if (client->mode->index == MODE_RECOVERY) {
+//        retassure(client->srnm,"ERROR: could not retrieve device serial number. Can't continue.\n");
+//
+//        retassure(!irecv_send_command(client->recovery->client, "bgcolor 0 255 0"), "ERROR: Unable to set bgcolor\n");
+//
+//        info("[WARNING] Setting bgcolor to green! If you don't see a green screen, then your device didn't boot iBEC correctly\n");
+//        sleep(2); //show the user a green screen!
+//        client->image4supported = true; //dirty hack to not require apticket
+//
+//        retassure(!recovery_enter_restore(client, build_identity),"ERROR: Unable to place device into restore mode\n");
+//
+//        client->image4supported = false;
+//        recovery_client_free(client);
+//    }
+//
+//    info("Cleaning up...\n");
+//
+//error:
+//    safeFree(client->sepfwdata);
+//    safeFreeCustom(buildmanifest, plist_free);
+//    if (!result && !err) info("DONE\n");
+//    return result ? abs(result) : err;
+}
+
+futurerestore::~futurerestore(){
+    recovery_client_free(_client);
+    idevicerestore_client_free(_client);
+    for (auto im4m : _im4ms){
+        safeFree(im4m.first);
+    }
+    safeFree(_ibootBuild);
+    safeFree(_firmwareJson);
+    safeFree(_firmwareTokens);
+    safeFree(__latestManifest);
+    safeFree(__latestFirmwareUrl);
+    for (auto plist : _aptickets){
+        safeFreeCustom(plist, plist_free);
+    }
+    safeFreeCustom(_sepbuildmanifest, plist_free);
+    safeFreeCustom(_basebandbuildmanifest, plist_free);
+}
+
+void futurerestore::loadFirmwareTokens(){
+    if (!_firmwareTokens){
+        if (!_firmwareJson) _firmwareJson = getFirmwareJson();
+        retassure(_firmwareJson,"[TSSC] could not get firmware.json\n");
+        int cnt = parseTokens(_firmwareJson, &_firmwareTokens);
+        retassure(cnt>0,"[TSSC] parsing %s.json failed\n",(0) ? "ota" : "firmware");
+    }
+}
+
+const char *futurerestore::getDeviceModelNoCopy(){
+    if (!_client->device || !_client->device->product_type){
+
+        int mode = getDeviceMode(true);
+        retassure(mode == MODE_NORMAL || mode == MODE_RECOVERY || mode == MODE_DFU, "unexpected device mode=%d\n",mode);
+        
+        switch (mode) {
+        case MODE_RESTORE:
+            _client->device = restore_get_irecv_device(_client);
+            break;
+        case MODE_NORMAL:
+            _client->device = normal_get_irecv_device(_client);
+            break;
+        case MODE_DFU:
+        case MODE_RECOVERY:
+            _client->device = dfu_get_irecv_device(_client);
+            break;
+        default:
+            break;
+        }
+    }
+
+    return _client->device->product_type;
+}
+
+const char *futurerestore::getDeviceBoardNoCopy(){
+    if (!_client->device || !_client->device->product_type){
+
+        int mode = getDeviceMode(true);
+        retassure(mode == MODE_NORMAL || mode == MODE_RECOVERY || mode == MODE_DFU, "unexpected device mode=%d\n",mode);
+        
+        switch (mode) {
+        case MODE_RESTORE:
+            _client->device = restore_get_irecv_device(_client);
+            break;
+        case MODE_NORMAL:
+            _client->device = normal_get_irecv_device(_client);
+            break;
+        case MODE_DFU:
+        case MODE_RECOVERY:
+            _client->device = dfu_get_irecv_device(_client);
+            break;
+        default:
+            break;
+        }
+    }
+    return _client->device->hardware_model;
+}
+
+char *futurerestore::getLatestManifest(){
+    if (!__latestManifest){
+        loadFirmwareTokens();
+
+        const char *device = getDeviceModelNoCopy();
+        t_iosVersion versVals;
+        memset(&versVals, 0, sizeof(versVals));
+        
+        int versionCnt = 0;
+        int i = 0;
+        char **versions = getListOfiOSForDevice(_firmwareTokens, device, 0, &versionCnt);
+        retassure(versionCnt, "[TSSC] failed finding latest firmware version\n");
+        char *bpos = NULL;
+        while((bpos = strstr((char*)(versVals.version = strdup(versions[i++])),"[B]")) != 0){
+            free((char*)versVals.version);
+            if (--versionCnt == 0) reterror("[TSSC] automatic selection of firmware couldn't find for non-beta versions\n");
+        }
+        info("[TSSC] selecting latest firmware version: %s\n",versVals.version);
+        if (bpos) *bpos= '\0';
+        if (versions) free(versions[versionCnt-1]),free(versions);
+        
+        ptr_smart<const char*>autofree(versVals.version); //make sure it get's freed after function finishes execution by either reaching end or throwing exception
+        
+        __latestFirmwareUrl = getFirmwareUrl(device, &versVals, _firmwareTokens);
+        retassure(__latestFirmwareUrl, "could not find url of latest firmware version\n");
+        
+        __latestManifest = getBuildManifest(__latestFirmwareUrl, device, versVals.version, versVals.buildID, 0);
+        retassure(__latestManifest, "could not get buildmanifest of latest firmware version\n");
+    }
+    
+    return __latestManifest;
+}
+
+char *futurerestore::getLatestFirmwareUrl(){
+    return getLatestManifest(),__latestFirmwareUrl;
+}
+
+//https://stackoverflow.com/a/27975357
+static void mkdirRecursive(const char *path, mode_t mode) {
+    char opath[PATH_MAX];
+    char *p;
+    size_t len;
+
+    strncpy(opath, path, sizeof(opath));
+    opath[sizeof(opath) - 1] = '\0';
+    len = strlen(opath);
+    if (len == 0)
+        return;
+    else if (opath[len - 1] == '/')
+        opath[len - 1] = '\0';
+    for(p = opath; *p; p++)
+        if (*p == '/') {
+            *p = '\0';
+            if (access(opath, F_OK))
+                __mkdir(opath, mode);
+            *p = '/';
+        }
+    if (access(opath, F_OK))         /* if path is not terminated with / */
+        __mkdir(opath, mode);
+}
+
+//https://gist.github.com/clalancette/bb5069a09c609e2d33c9858fcc6e170e
+static bool is_dir(const std::string& dir)
+{
+  struct stat st;
+  ::stat(dir.c_str(), &st);
+  return S_ISDIR(st.st_mode);
+}
+
+static void walk_directory(const std::string& startdir, const std::string& inputdir, zip_t *zipper)
+{
+  DIR *dp = ::opendir(inputdir.c_str());
+  if (dp == nullptr) {
+    throw std::runtime_error("Failed to open input directory: " + std::string(::strerror(errno)));
+  }
+
+  struct dirent *dirp;
+  while ((dirp = readdir(dp)) != NULL) {
+    if (dirp->d_name != std::string(".") && dirp->d_name != std::string("..")) {
+      std::string fullname = inputdir + "/" + dirp->d_name;
+      if (is_dir(fullname)) {
+        if (zip_dir_add(zipper, fullname.substr(startdir.length() + 1).c_str(), ZIP_FL_ENC_UTF_8) < 0) {
+          throw std::runtime_error("Failed to add directory to zip: " + std::string(zip_strerror(zipper)));
+        }
+        walk_directory(startdir, fullname, zipper);
+      } else {
+        zip_source_t *source = zip_source_file(zipper, fullname.c_str(), 0, 0);
+        if (source == nullptr) {
+          throw std::runtime_error("Failed to add file to zip: " + std::string(zip_strerror(zipper)));
+        }
+        if (zip_file_add(zipper, fullname.substr(startdir.length() + 1).c_str(), source, ZIP_FL_ENC_UTF_8) < 0) {
+          zip_source_free(source);
+          throw std::runtime_error("Failed to add file to zip: " + std::string(zip_strerror(zipper)));
+        }
+      }
+    }
+  }
+  ::closedir(dp);
+}
+
+static void zip_directory(const std::string& inputdir, const std::string& output_filename)
+{
+  int errorp;
+  zip_t *zipper = zip_open(output_filename.c_str(), ZIP_CREATE | ZIP_EXCL, &errorp);
+  if (zipper == nullptr) {
+    zip_error_t ziperror;
+    zip_error_init_with_code(&ziperror, errorp);
+    throw std::runtime_error("Failed to open output file " + output_filename + ": " + zip_error_strerror(&ziperror));
+  }
+
+  try {
+    walk_directory(inputdir, inputdir, zipper);
+  } catch(...) {
+    zip_close(zipper);
+    throw;
+  }
+
+  zip_close(zipper);
+}
+
+void futurerestore::downloadLatestRose(){
+    char * manifeststr = getLatestManifest();
+    char *roseStr = (elemExists("Rap,RTKitOS", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Rap,RTKitOS", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    if(roseStr) {
+        info("downloading Rose firmware\n\n");
+        char roseStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(roseStr1, "%s%s", tmp, roseStr);
+        std::string rose(roseStr1);
+        size_t pos = rose.find_last_of('/');
+        if (pos != std::string::npos) {
+            rose.erase(pos + 1, rose.length());
+            mkdirRecursive(rose.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), roseStr, roseStr1), "could not download Rose\n");
+        }
+    }
+}
+
+void futurerestore::downloadLatestSE(){
+    char * manifeststr = getLatestManifest();
+    char *seStr = (elemExists("SE,UpdatePayload", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("SE,UpdatePayload", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    if(seStr) {
+        info("downloading SE firmware\n\n");
+        char seStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(seStr1, "%s%s", tmp, seStr);
+        std::string se(seStr1);
+        size_t pos = se.find_last_of('/');
+        if (pos != std::string::npos) {
+            se.erase(pos, se.length());
+            mkdirRecursive(se.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), seStr, seStr1), "could not download SE\n");
+        }
+    }
+}
+
+void futurerestore::downloadLatestSavage(){
+    char * manifeststr = getLatestManifest();
+    char *savageB0DevStr = (elemExists("Savage,B0-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B0-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB0DevVTStr = (elemExists("Savage,B0-Dev-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B0-Dev-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB0ProdStr = (elemExists("Savage,B0-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B0-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB0ProdVTStr = (elemExists("Savage,B0-Prod-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B0-Prod-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB2DevStr = (elemExists("Savage,B2-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B2-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB2DevVTStr = (elemExists("Savage,B2-Dev-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B2-Dev-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB2ProdStr = (elemExists("Savage,B2-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B2-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageB2ProdVTStr = (elemExists("Savage,B2-Prod-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,B2-Prod-PatchVT", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageBADevStr = (elemExists("Savage,BA-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,BA-Dev-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *savageBAProdStr = (elemExists("Savage,BA-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("Savage,BA-Prod-Patch", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    if(savageB0DevStr) {
+        info("downloading Savage,B0-Dev-Patch\n\n");
+        char savageB0DevStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB0DevStr1, "%s%s", FIRMWARES_TMP_PATH, savageB0DevStr);
+        std::string savage(savageB0DevStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB0DevStr, savageB0DevStr1), "could not download Savage,B0-Dev-Patch\n");
+        }
+    }
+    if(savageB0DevVTStr) {
+        info("downloading Savage,B0-Dev-PatchVT\n\n");
+        char savageB0DevVTStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB0DevVTStr1, "%s%s", FIRMWARES_TMP_PATH, savageB0DevVTStr);
+        std::string savage(savageB0DevVTStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB0DevVTStr, savageB0DevVTStr1), "could not download Savage,B0-Dev-PatchVT\n");
+        }
+    }
+    if(savageB0ProdStr) {
+        info("downloading Savage,B0-Prod-Patch\n\n");
+        char savageB0ProdStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB0ProdStr1, "%s%s", FIRMWARES_TMP_PATH, savageB0ProdStr);
+        std::string savage(savageB0ProdStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB0ProdStr, savageB0ProdStr1), "could not download Savage,B0-Prod-Patch\n");
+        }
+    }
+    if(savageB0ProdVTStr) {
+        info("downloading Savage,B0-Prod-PatchVT\n\n");
+        char savageB0ProdVTStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB0ProdVTStr1, "%s%s", FIRMWARES_TMP_PATH, savageB0ProdVTStr);
+        std::string savage(savageB0ProdVTStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB0ProdVTStr, savageB0ProdVTStr1), "could not download Savage,B0-Prod-PatchVT\n");
+        }
+    }
+    if(savageB2DevStr) {
+        info("downloading Savage,B2-Dev-Patch\n\n");
+        char savageB2DevStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB2DevStr1, "%s%s", FIRMWARES_TMP_PATH, savageB2DevStr);
+        std::string savage(savageB2DevStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB2DevStr, savageB2DevStr1), "could not download Savage,B2-Dev-Patch\n");
+        }
+    }
+    if(savageB2DevVTStr) {
+        info("downloading Savage,B2-Dev-PatchV\n\n");
+        char savageB2DevVTStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB2DevVTStr1, "%s%s", FIRMWARES_TMP_PATH, savageB2DevVTStr);
+        std::string savage(savageB2DevVTStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB2DevVTStr, savageB2DevVTStr1), "could not download Savage,B2-Dev-PatchV\n");
+        }
+    }
+    if(savageB2ProdStr) {
+        info("downloading Savage,B2-Prod-Patch\n\n");
+        char savageB2ProdStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB2ProdStr1, "%s%s", FIRMWARES_TMP_PATH, savageB2ProdStr);
+        std::string savage(savageB2ProdStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB2ProdStr, savageB2ProdStr1), "could not download Savage,B2-Prod-Patch\n");
+        }
+    }
+    if(savageB2ProdVTStr) {
+        info("downloading Savage,B2-Prod-PatchVT\n\n");
+        char savageB2ProdVTStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageB2ProdVTStr1, "%s%s", FIRMWARES_TMP_PATH, savageB2ProdVTStr);
+        std::string savage(savageB2ProdVTStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageB2ProdVTStr, savageB2ProdVTStr1), "could not download Savage,B2-Prod-PatchVT\n");
+        }
+    }
+    if(savageBADevStr) {
+        info("downloading Savage,BA-Dev-Patch\n\n");
+        char savageBADevStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageBADevStr1, "%s%s", FIRMWARES_TMP_PATH, savageBADevStr);
+        std::string savage(savageBADevStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageBADevStr, savageBADevStr1), "could not download Savage,BA-Dev-Patch\n");
+        }
+    }
+    if(savageBAProdStr) {
+        info("downloading Savage,BA-Prod-Patch\n\n");
+        char savageBAProdStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(savageBAProdStr1, "%s%s", FIRMWARES_TMP_PATH, savageBAProdStr);
+        std::string savage(savageBAProdStr1);
+        size_t pos = savage.find_last_of('/');
+        if (pos != std::string::npos) {
+            savage.erase(pos + 1, savage.length());
+            mkdirRecursive(savage.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), savageBAProdStr, savageBAProdStr1), "could not download Savage,BA-Prod-Patch\n");
+        }
+    }
+}
+
+void futurerestore::downloadLatestVeridian(){
+    char * manifeststr = getLatestManifest();
+    char *veridianStr = (elemExists("BMU,DigestMap", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("BMU,DigestMap", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    char *veridianFWMStr = (elemExists("BMU,FirmwareMap", manifeststr, getDeviceBoardNoCopy(), 0) ? getPathOfElementInManifest("BMU,FirmwareMap", manifeststr, getDeviceBoardNoCopy(), 0) : NULL);
+    if(veridianStr) {
+        info("downloading Veridian DigestMap\n\n");
+        char veridianStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(veridianStr1, "%s%s", FIRMWARES_TMP_PATH, veridianStr);
+        std::string veridian(veridianStr1);
+        size_t pos = veridian.find_last_of('/');
+        if (pos != std::string::npos) {
+            veridian.erase(pos + 1, veridian.length());
+            mkdirRecursive(veridian.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), veridianStr, veridianStr1), "could not download Veridian DigestMap\n");
+        }
+    }
+    if(veridianFWMStr) {
+        info("downloading Veridian FirmwareMap\n\n");
+        char veridianFWMStr1[PATH_MAX];
+        char *tmp = FIRMWARES_TMP_PATH;
+        sprintf(veridianFWMStr1, "%s%s", FIRMWARES_TMP_PATH, veridianFWMStr);
+        std::string veridian(veridianFWMStr1);
+        size_t pos = veridian.find_last_of('/');
+        if (pos != std::string::npos) {
+            veridian.erase(pos + 1, veridian.length());
+            mkdirRecursive(veridian.c_str(), 0755);
+            retassure(!downloadPartialzip(getLatestFirmwareUrl(), veridianFWMStr, veridianFWMStr1), "could not download Veridian FirmwareMap\n");
+        }
+    }
+}
+
+void futurerestore::downloadLatestFirmwareComponents(){
+    info("Downloading the latest firmware components...\n");
+    __mkdir(FIRMWARES_TMP_PATH, 0755);
+    char zip_name[PATH_MAX];
+    sprintf(zip_name, "%s/%s", FUTURERESTORE_TMP_PATH, "Firmwares.ipsw");
+    unlink(zip_name);
+    downloadLatestRose();
+    downloadLatestSE();
+    downloadLatestSavage();
+    downloadLatestVeridian();
+    zip_directory(FIRMWARES_TMP_PATH, zip_name);
+    rmdir(FIRMWARES_TMP_PATH); //remove the dir if its empty so zip won't fail
+    struct stat st{0};
+    if(!stat(FIRMWARES_TMP_PATH, &st))
+    {
+        retassure(!stat(zip_name, &st), "could not zip Firmwares to ipsw\n");
+        char *firmware_zip = zip_name;
+        _client->ipsw2 = strdup(firmware_zip);
+    }
+    info("Finished downloading the latest firmware components!\n");
+}
+
+void futurerestore::loadLatestBaseband(){
+    char * manifeststr = getLatestManifest();
+    char *pathStr = getPathOfElementInManifest("BasebandFirmware", manifeststr, getDeviceBoardNoCopy(), 0);
+    info("downloading Baseband\n\n");
+    retassure(!downloadPartialzip(getLatestFirmwareUrl(), pathStr, _basebandPath = BASEBAND_TMP_PATH), "could not download baseband\n");
+    saveStringToFile(manifeststr, BASEBAND_MANIFEST_TMP_PATH);
+    setBasebandManifestPath(BASEBAND_MANIFEST_TMP_PATH);
+    setBasebandPath(BASEBAND_TMP_PATH);
+}
+
+void futurerestore::loadLatestSep(){
+    char * manifeststr = getLatestManifest();
+    char *pathStr = getPathOfElementInManifest("SEP", manifeststr, getDeviceBoardNoCopy(), 0);
+    info("downloading SEP\n\n");
+    retassure(!downloadPartialzip(getLatestFirmwareUrl(), pathStr, SEP_TMP_PATH), "could not download SEP\n");
+    loadSep(SEP_TMP_PATH);
+    saveStringToFile(manifeststr, SEP_MANIFEST_TMP_PATH);
+    setSepManifestPath(SEP_MANIFEST_TMP_PATH);
+}
+
+void futurerestore::setSepManifestPath(const char *sepManifestPath){
+    retassure(_sepbuildmanifest = loadPlistFromFile(_sepbuildmanifestPath = sepManifestPath), "failed to load SEPManifest");
+}
+
+void futurerestore::setBasebandManifestPath(const char *basebandManifestPath){
+    retassure(_basebandbuildmanifest = loadPlistFromFile(_basebandbuildmanifestPath = basebandManifestPath), "failed to load BasebandManifest");
+};
+
+void futurerestore::loadSep(const char *sepPath){
+    FILE *fsep = NULL;
+    retassure(fsep = fopen(sepPath, "rb"), "failed to read SEP\n");
+    
+    fseek(fsep, 0, SEEK_END);
+    _client->sepfwdatasize = ftell(fsep);
+    fseek(fsep, 0, SEEK_SET);
+    
+    retassure(_client->sepfwdata = (char*)malloc(_client->sepfwdatasize), "failed to malloc memory for SEP\n");
+    
+    size_t freadRet=0;
+    retassure((freadRet = fread(_client->sepfwdata, 1, _client->sepfwdatasize, fsep)) == _client->sepfwdatasize,
+              "failed to load SEP. size=%zu but fread returned %zu\n",_client->sepfwdatasize,freadRet);
+    
+    fclose(fsep);
+}
+
+void futurerestore::setBasebandPath(const char *basebandPath){
+    FILE *fbb = NULL;
+
+    retassure(fbb = fopen(basebandPath, "rb"), "failed to read Baseband");
+    _basebandPath = basebandPath;
+    fclose(fbb);
+}
+
+#pragma mark static methods
+inline void futurerestore::saveStringToFile(const char *str, const char *path){
+    FILE *f = NULL;
+    retassure(f = fopen(path, "w"), "can't save file at %s\n",path);
+    size_t len = strlen(str);
+    size_t wlen = fwrite(str, 1, len, f);
+    fclose(f);
+    retassure(len == wlen, "saving file failed, wrote=%zu actual=%zu\n",wlen,len);
+}
+
+std::pair<const char *,size_t> futurerestore::getNonceFromSCAB(const char* scab, size_t scabSize){
+    retassure(scab, "Got empty SCAB\n");
+    
+    img4tool::ASN1DERElement bacs(scab,scabSize);
+    
+    try {
+        bacs[3];
+    } catch (...) {
+        reterror("unexpected number of Elements in SCAB sequence (expects 4)\n");
+    }
+        
+    img4tool::ASN1DERElement mainSet = bacs[1];
+
+    for (auto &elem : mainSet) {
+        if (*(uint8_t*)elem.buf() == 0x92) {
+            return {(char*)elem.payload(),elem.payloadSize()};
+        }
+    }
+    reterror("failed to get nonce from SCAB");
+    return {NULL,0};
+}
+
+uint64_t futurerestore::getEcidFromSCAB(const char* scab, size_t scabSize){
+    retassure(scab, "Got empty SCAB\n");
+    
+    img4tool::ASN1DERElement bacs(scab,scabSize);
+    
+    try {
+        bacs[3];
+    } catch (...) {
+        reterror("unexpected number of Elements in SCAB sequence (expects 4)\n");
+    }
+    
+    img4tool::ASN1DERElement mainSet = bacs[1];
+
+    for (auto &elem : mainSet) {
+        if (*(uint8_t*)elem.buf() == 0x81) {
+            uint64_t ret = 0;
+            for (int i=0; i<elem.payloadSize(); i++) {
+                ret <<=8;
+                ret |= ((uint8_t*)elem.payload())[i];
+            }
+            return ret;
+        }
+    }
+
+    reterror("failed to get ECID from SCAB");
+    return 0;
+}
+
+std::pair<const char *,size_t>futurerestore::getRamdiskHashFromSCAB(const char* scab, size_t scabSize){
+    retassure(scab, "Got empty SCAB\n");
+
+    img4tool::ASN1DERElement bacs(scab,scabSize);
+
+    try {
+        bacs[3];
+    } catch (...) {
+        reterror("unexpected number of Elements in SCAB sequence (expects 4)\n");
+    }
+
+    img4tool::ASN1DERElement mainSet = bacs[1];
+
+    for (auto &elem : mainSet) {
+        if (*(uint8_t*)elem.buf() == 0x9A) {
+            return {(char*)elem.payload(),elem.payloadSize()};
+        }
+    }
+    reterror("failed to get nonce from SCAB");
+    return {NULL,0};
+}
+
+plist_t futurerestore::loadPlistFromFile(const char *path){
+    plist_t ret = NULL;
+    
+    FILE *f = fopen(path,"rb");
+    if (!f){
+        error("could not open file %s\n",path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    size_t bufSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    char *buf = (char*)malloc(bufSize);
+    if (!buf){
+        error("failed to alloc memory\n");
+        return NULL;
+    }
+    
+    size_t freadRet = 0;
+    if ((freadRet = fread(buf, 1, bufSize, f)) != bufSize){
+        error("fread=%zu but bufsize=%zu",freadRet,bufSize);
+        return NULL;
+    }
+    fclose(f);
+    
+    if (memcmp(buf, "bplist00", 8) == 0)
+        plist_from_bin(buf, (uint32_t)bufSize, &ret);
+    else
+        plist_from_xml(buf, (uint32_t)bufSize, &ret);
+    free(buf);
+    
+    return ret;
+}
+
+char *futurerestore::getPathOfElementInManifest(const char *element, const char *manifeststr, const char *boardConfig, int isUpdateInstall){
+    char *pathStr = NULL;
+    ptr_smart<plist_t> buildmanifest(NULL,plist_free);
+    
+    plist_from_xml(manifeststr, (uint32_t)strlen(manifeststr), &buildmanifest);
+    
+    if (plist_t identity = getBuildidentityWithBoardconfig(buildmanifest._p, boardConfig, isUpdateInstall))
+        if (plist_t manifest = plist_dict_get_item(identity, "Manifest"))
+            if (plist_t elem = plist_dict_get_item(manifest, element))
+                if (plist_t info = plist_dict_get_item(elem, "Info"))
+                    if (plist_t path = plist_dict_get_item(info, "Path"))
+                        if (plist_get_string_val(path, &pathStr), pathStr)
+                            goto noerror;
+    
+    reterror("could not get %s path\n",element);
+noerror:
+    return pathStr;
+}
+
+bool futurerestore::elemExists(const char *element, const char *manifeststr, const char *boardConfig, int isUpdateInstall){
+    char *pathStr = NULL;
+    ptr_smart<plist_t> buildmanifest(NULL,plist_free);
+    
+    plist_from_xml(manifeststr, (uint32_t)strlen(manifeststr), &buildmanifest);
+    
+    if (plist_t identity = getBuildidentityWithBoardconfig(buildmanifest._p, boardConfig, isUpdateInstall))
+        if (plist_t manifest = plist_dict_get_item(identity, "Manifest"))
+            if (plist_t elem = plist_dict_get_item(manifest, element))
+                if (plist_t info = plist_dict_get_item(elem, "Info"))
+                    if (plist_t path = plist_dict_get_item(info, "Path"))
+                        if (plist_get_string_val(path, &pathStr), pathStr)
+                            goto noerror;
+    
+    return false;
+noerror:
+    return true;
+}
+
+std::string futurerestore::getGeneratorFromSHSH2(const plist_t shsh2){
+    plist_t pGenerator = NULL;
+    uint64_t gen = 0;
+    char *genstr = NULL;
+    cleanup([&]{
+        safeFree(genstr);
+    });
+    retassure(pGenerator = plist_dict_get_item(shsh2, "generator"), "signing ticket file does not contain generator");
+    
+    retassure(plist_get_node_type(pGenerator) == PLIST_STRING, "generator has unexpected type! We expect string of the format 0x%16llx");
+    
+    plist_get_string_val(pGenerator, &genstr);
+    assure(genstr);
+    
+    sscanf(genstr, "0x%16llx",&gen);
+    retassure(gen, "failed to parse generator. Make sure it is in format 0x%16llx");
+    
+    return {genstr};
+}
+
+//
+//  futurerestore.hpp
+//  futurerestore
+//
+//  Created by tihmstar on 14.09.16.
+//  Copyright © 2016 tihmstar. All rights reserved.
+//
+
+#ifndef futurerestore_hpp
+#define futurerestore_hpp
+
+//make sure WIN32 is defined if compiling for windows
+#if defined _WIN32 || defined __CYGWIN__
+#ifndef WIN32
+#define WIN32
+#endif
+#endif
+
+#include <stdio.h>
+#include <functional>
+#include <vector>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <string.h>
+#include <zip.h>
+#include "idevicerestore.h"
+#include <jssy.h>
+#include <plist/plist.h>
+
+using namespace std;
+
+template <typename T>
+class ptr_smart {
+    std::function<void(T)> _ptr_free = NULL;
+public:
+    T _p;
+    ptr_smart(T p, function<void(T)> ptr_free){static_assert(is_pointer<T>(), "error: this is for pointers only\n"); _p = p;_ptr_free = ptr_free;}
+    ptr_smart(T p){_p = p;}
+    ptr_smart(){_p = NULL;}
+    ptr_smart(ptr_smart &&p){ _p = p._p; _ptr_free = p._ptr_free; p._p = NULL; p._ptr_free = NULL;}
+    ptr_smart& operator =(ptr_smart &&p){_p = p._p; _ptr_free = p._ptr_free; p._p = NULL; p._ptr_free = NULL; return *this;}
+    T operator =(T p){ _p = p; return _p;}
+    T operator =(T &p){_p = p; p = NULL; return _p;}
+    T *operator&(){return &_p;}
+    explicit operator const T() const {return _p;}
+    operator const void*() const {return _p;}
+    ~ptr_smart(){if (_p) (_ptr_free) ? _ptr_free(_p) : free((void*)_p);}
+};
+
+class futurerestore {
+    struct idevicerestore_client_t* _client;
+    char *_ibootBuild = NULL;
+    bool _didInit = false;
+    vector<plist_t> _aptickets;
+    vector<pair<char *, size_t>>_im4ms;
+    int _foundnonce = -1;
+    bool _isUpdateInstall = false;
+    bool _isPwnDfu = false;
+    
+    char *_firmwareJson = NULL;
+    jssytok_t *_firmwareTokens = NULL;;
+    char *__latestManifest = NULL;
+    char *__latestFirmwareUrl = NULL;
+    
+    plist_t _sepbuildmanifest = NULL;
+    plist_t _basebandbuildmanifest = NULL;
+    
+    const char *_basebandPath = NULL;;
+    const char *_sepbuildmanifestPath = NULL;
+    const char *_basebandbuildmanifestPath = NULL;
+    
+    bool _enterPwnRecoveryRequested = false;
+    bool _rerestoreiOS9 = false;
+    //methods
+    void enterPwnRecovery(plist_t build_identity, std::string bootargs = "");
+    
+public:
+    futurerestore(bool isUpdateInstall = false, bool isPwnDfu = false);
+    bool init();
+    int getDeviceMode(bool reRequest);
+    uint64_t getDeviceEcid();
+    void putDeviceIntoRecovery();
+    void setAutoboot(bool val);
+    void exitRecovery();
+    void waitForNonce();
+    void waitForNonce(vector<const char *>nonces, size_t nonceSize);
+    void loadAPTickets(const vector<const char *> &apticketPaths);
+    char *getiBootBuild();
+    
+    plist_t nonceMatchesApTickets();
+    std::pair<const char *,size_t> nonceMatchesIM4Ms();
+
+    void loadFirmwareTokens();
+    const char *getDeviceModelNoCopy();
+    const char *getDeviceBoardNoCopy();
+    char *getLatestManifest();
+    char *getLatestFirmwareUrl();
+    void downloadLatestRose();
+    void downloadLatestSE();
+    void downloadLatestSavage();
+    void downloadLatestVeridian();
+    void downloadLatestFirmwareComponents();
+    void loadLatestBaseband();
+    void loadLatestSep();
+    
+    void setSepManifestPath(const char *sepManifestPath);
+    void setBasebandManifestPath(const char *basebandManifestPath);
+    void loadSep(const char *sepPath);
+    void setBasebandPath(const char *basebandPath);
+    bool isUpdateInstall(){return _isUpdateInstall;};
+    
+    plist_t sepManifest(){return _sepbuildmanifest;};
+    plist_t basebandManifest(){return _basebandbuildmanifest;};
+    const char *sepManifestPath(){return _sepbuildmanifestPath;};
+    const char *basebandManifestPath(){return _basebandbuildmanifestPath;};
+    bool is32bit(){return !is_image4_supported(_client);};
+    
+    uint64_t getBasebandGoldCertIDFromDevice();
+    
+    void doRestore(const char *ipsw);
+    int doJustBoot(const char *ipsw, std::string bootargs = "");
+    
+    ~futurerestore();
+    
+    static std::pair<const char *,size_t> getRamdiskHashFromSCAB(const char* scab, size_t scabSize);
+    static std::pair<const char *,size_t> getNonceFromSCAB(const char* scab, size_t scabSize);
+    static uint64_t getEcidFromSCAB(const char* scab, size_t scabSize);
+    static plist_t loadPlistFromFile(const char *path);
+    static void saveStringToFile(const char *str, const char *path);
+    static char *getPathOfElementInManifest(const char *element, const char *manifeststr, const char *boardConfig, int isUpdateInstall);
+    bool elemExists(const char *element, const char *manifeststr, const char *boardConfig, int isUpdateInstall);
+    static std::string getGeneratorFromSHSH2(const plist_t shsh2);
+};
+
+#endif /* futurerestore_hpp */
+
+//
+//  main.cpp
+//  futurerestore
+//
+//  Created by tihmstar on 14.09.16.
+//  Copyright © 2016 tihmstar. All rights reserved.
+//
+
+#include <iostream>
+#include <getopt.h>
+#include <string.h>
+#include <unistd.h>
+#include <vector>
+#include "futurerestore.hpp"
+
+extern "C"{
+#include "tsschecker.h"
+#undef VERSION_COMMIT_SHA
+#undef VERSION_COMMIT_COUNT
+};
+
+#include <libgeneral/macros.h>
+#include <img4tool/img4tool.hpp>
+#ifdef HAVE_LIBIPATCHER
+#include <libipatcher/libipatcher.hpp>
+#endif
+
+#ifdef WIN32
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#endif
+
+static struct option longopts[] = {
+    { "apticket",           required_argument,      NULL, 't' },
+    { "baseband",           required_argument,      NULL, 'b' },
+    { "baseband-manifest",  required_argument,      NULL, 'p' },
+    { "sep",                required_argument,      NULL, 's' },
+    { "sep-manifest",       required_argument,      NULL, 'm' },
+    { "wait",               no_argument,            NULL, 'w' },
+    { "update",             no_argument,            NULL, 'u' },
+    { "debug",              no_argument,            NULL, 'd' },
+    { "exit-recovery",      no_argument,            NULL, 'e' },
+    { "latest-sep",         no_argument,            NULL, '0' },
+    { "latest-baseband",    no_argument,            NULL, '1' },
+    { "no-baseband",        no_argument,            NULL, '2' },
+#ifdef HAVE_LIBIPATCHER
+    { "use-pwndfu",         no_argument,            NULL, '3' },
+    { "just-boot",          optional_argument,      NULL, '4' },
+#endif
+    { NULL, 0, NULL, 0 }
+};
+
+#define FLAG_WAIT               1 << 0
+#define FLAG_UPDATE             1 << 1
+#define FLAG_LATEST_SEP         1 << 2
+#define FLAG_LATEST_BASEBAND    1 << 3
+#define FLAG_NO_BASEBAND        1 << 4
+#define FLAG_IS_PWN_DFU         1 << 5
+
+void cmd_help(){
+    printf("Usage: futurerestore [OPTIONS] iPSW\n");
+    printf("Allows restoring to non-matching firmware with custom SEP+baseband\n");
+    printf("\nGeneral options:\n");
+    printf("  -t, --apticket PATH\t\tSigning tickets used for restoring\n");
+    printf("  -u, --update\t\t\tUpdate instead of erase install (requires appropriate APTicket)\n");
+    printf("              \t\t\tDO NOT use this parameter, if you update from jailbroken firmware!\n");
+    printf("  -w, --wait\t\t\tKeep rebooting until ApNonce matches APTicket (ApNonce collision, unreliable)\n");
+    printf("  -d, --debug\t\t\tShow all code, use to save a log for debug testing\n");
+    printf("  -e, --exit-recovery\t\tExit recovery mode and quit\n");
+    
+#ifdef HAVE_LIBIPATCHER
+    printf("\nOptions for downgrading with Odysseus:\n");
+    printf("      --use-pwndfu\t\tRestoring devices with Odysseus method. Device needs to be in pwned DFU mode already\n");
+    printf("      --just-boot=\"-v\"\t\tTethered booting the device from pwned DFU mode. You can optionally set boot-args\n");
+#endif
+        
+    printf("\nOptions for SEP:\n");
+    printf("      --latest-sep\t\tUse latest signed SEP instead of manually specifying one (may cause bad restore)\n");
+    printf("  -s, --sep PATH\t\tSEP to be flashed\n");
+    printf("  -m, --sep-manifest PATH\tBuildManifest for requesting SEP ticket\n");
+        
+    printf("\nOptions for baseband:\n");
+    printf("      --latest-baseband\t\tUse latest signed baseband instead of manually specifying one (may cause bad restore)\n");
+    printf("  -b, --baseband PATH\t\tBaseband to be flashed\n");
+    printf("  -p, --baseband-manifest PATH\tBuildManifest for requesting baseband ticket\n");
+    printf("      --no-baseband\t\tSkip checks and don't flash baseband\n");
+    printf("                   \t\tOnly use this for device without a baseband (eg. iPod touch or some Wi-Fi only iPads)\n\n");
+}
+
+using namespace std;
+using namespace tihmstar;
+int main_r(int argc, const char * argv[]) {
+#ifdef WIN32
+    DWORD termFlags;
+    HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleMode(handle, &termFlags))
+        SetConsoleMode(handle, termFlags | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+    int err=0;
+    printf("Version: " VERSION_COMMIT_SHA " - " VERSION_COMMIT_COUNT "\n");
+    printf("%s\n",tihmstar::img4tool::version());
+#ifdef HAVE_LIBIPATCHER
+    printf("%s\n",libipatcher::version());
+    printf("Odysseus for 32-bit support: yes\n");
+    printf("Odysseus for 64-bit support: %s\n",(libipatcher::has64bitSupport() ? "yes" : "no"));
+#else
+    printf("Odysseus support: no\n");
+#endif
+
+    int optindex = 0;
+    int opt = 0;
+    long flags = 0;
+    bool exitRecovery = false;
+    
+    int isSepManifestSigned = 0;
+    int isBasebandSigned = 0;
+    
+    const char *ipsw = NULL;
+    const char *basebandPath = NULL;
+    const char *basebandManifestPath = NULL;
+    const char *sepPath = NULL;
+    const char *sepManifestPath = NULL;
+    const char *bootargs = NULL;
+    
+    vector<const char*> apticketPaths;
+    
+    t_devicevals devVals = {0};
+    t_iosVersion versVals = {0};
+    
+    if (argc == 1){
+        cmd_help();
+        return -1;
+    }
+
+    while ((opt = getopt_long(argc, (char* const *)argv, "ht:b:p:s:m:wude0123", longopts, &optindex)) > 0) {
+        switch (opt) {
+            case 't': // long option: "apticket"; can be called as short option
+                apticketPaths.push_back(optarg);
+                break;
+            case 'b': // long option: "baseband"; can be called as short option
+                basebandPath = optarg;
+                break;
+            case 'p': // long option: "baseband-manifest"; can be called as short option
+                basebandManifestPath = optarg;
+                break;
+            case 's': // long option: "sep"; can be called as short option
+                sepPath = optarg;
+                break;
+            case 'm': // long option: "sep-manifest"; can be called as short option
+                sepManifestPath = optarg;
+                break;
+            case 'w': // long option: "wait"; can be called as short option
+                flags |= FLAG_WAIT;
+                break;
+            case 'u': // long option: "update"; can be called as short option
+                flags |= FLAG_UPDATE;
+                break;
+            case '0': // long option: "latest-sep";
+                flags |= FLAG_LATEST_SEP;
+                break;
+            case '1': // long option: "latest-baseband";
+                flags |= FLAG_LATEST_BASEBAND;
+                break;
+            case '2': // long option: "no-baseband";
+                flags |= FLAG_NO_BASEBAND;
+                break;
+#ifdef HAVE_LIBIPATCHER
+            case '3': // long option: "use-pwndfu";
+                flags |= FLAG_IS_PWN_DFU;
+                break;
+            case '4': // long option: "just-boot";
+                bootargs = (optarg) ? optarg : "";
+                break;
+            break;
+#endif
+            case 'e': // long option: "exit-recovery"; can be called as short option
+                exitRecovery = true;
+                break;
+            case 'd': // long option: "debug"; can be called as short option
+                idevicerestore_debug = 1;
+                break;
+            default:
+                cmd_help();
+                return -1;
+        }
+    }
+    
+    if (argc-optind == 1) {
+        argc -= optind;
+        argv += optind;
+        
+        ipsw = argv[0];
+    }else if (argc == optind && flags & FLAG_WAIT) {
+        info("User requested to only wait for ApNonce to match, but not for actually restoring\n");
+    }else if (exitRecovery){
+        info("Exiting from recovery mode to normal mode\n");
+    }else{
+        error("argument parsing failed! agrc=%d optind=%d\n",argc,optind);
+        if (idevicerestore_debug){
+            for (int i=0; i<argc; i++) {
+                printf("argv[%d]=%s\n",i,argv[i]);
+            }
+        }
+        return -5;
+    }
+    
+    futurerestore client(flags & FLAG_UPDATE, flags & FLAG_IS_PWN_DFU);
+    retassure(client.init(),"can't init, no device found\n");
+    
+    printf("futurerestore init done\n");
+    retassure(!bootargs || (flags & FLAG_IS_PWN_DFU),"--just-boot requires --use-pwndfu\n");
+    
+    if (exitRecovery) {
+        client.exitRecovery();
+        info("Done\n");
+        return 0;
+    }
+    
+    try {
+        if (apticketPaths.size()) client.loadAPTickets(apticketPaths);
+        
+        if (!(
+              ((apticketPaths.size() && ipsw)
+               && ((basebandPath && basebandManifestPath) || ((flags & FLAG_LATEST_BASEBAND) || (flags & FLAG_NO_BASEBAND)))
+               && ((sepPath && sepManifestPath) || (flags & FLAG_LATEST_SEP) || client.is32bit())
+              ) || (ipsw && bootargs && (flags & FLAG_IS_PWN_DFU))
+            )) {
+            
+            if (!(flags & FLAG_WAIT) || ipsw){
+                error("missing argument\n");
+                cmd_help();
+                err = -2;
+            }else{
+                client.putDeviceIntoRecovery();
+                client.waitForNonce();
+                info("Done\n");
+            }
+            goto error;
+        }
+        if (bootargs){
+            
+        }else{
+            devVals.deviceModel = (char*)client.getDeviceModelNoCopy();
+            devVals.deviceBoard = (char*)client.getDeviceBoardNoCopy();
+            
+            if (flags & FLAG_LATEST_SEP){
+                info("user specified to use latest signed SEP (WARNING, THIS CAN CAUSE A NON-WORKING RESTORE)\n");
+                client.loadLatestSep();
+            }else if (!client.is32bit()){
+                client.loadSep(sepPath);
+                client.setSepManifestPath(sepManifestPath);
+            }
+            
+            versVals.basebandMode = kBasebandModeWithoutBaseband;
+            if (!client.is32bit() && !(isSepManifestSigned = isManifestSignedForDevice(client.sepManifestPath(), &devVals, &versVals))){
+                reterror("SEP firmware is NOT being signed!\n");
+            }
+            if (flags & FLAG_NO_BASEBAND){
+                printf("\nWARNING: user specified is not to flash a baseband. This can make the restore fail if the device needs a baseband!\n");
+                printf("if you added this flag by mistake, you can press CTRL-C now to cancel\n");
+                int c = 10;
+                printf("continuing restore in ");
+                while (c) {
+                    printf("%d ",c--);
+                    fflush(stdout);
+                    sleep(1);
+                }
+                printf("\n");
+            }else{
+                if (flags & FLAG_LATEST_BASEBAND){
+                    info("user specified to use latest signed baseband (WARNING, THIS CAN CAUSE A NON-WORKING RESTORE)\n");
+                    client.loadLatestBaseband();
+                }else{
+                    client.setBasebandPath(basebandPath);
+                    client.setBasebandManifestPath(basebandManifestPath);
+                    printf("Did set SEP+baseband path and firmware\n");
+                }
+                
+                versVals.basebandMode = kBasebandModeOnlyBaseband;
+                if (!(devVals.bbgcid = client.getBasebandGoldCertIDFromDevice())){
+                    printf("[WARNING] using tsschecker's fallback to get BasebandGoldCertID. This might result in invalid baseband signing status information\n");
+                }
+                if (!(isBasebandSigned = isManifestSignedForDevice(client.basebandManifestPath(), &devVals, &versVals))) {
+                    reterror("baseband firmware is NOT being signed!\n");
+                }
+            }
+        }
+        client.downloadLatestFirmwareComponents();
+        client.putDeviceIntoRecovery();
+        if (flags & FLAG_WAIT){
+            client.waitForNonce();
+        }
+    } catch (int error) {
+        err = error;
+        printf("[Error] Fail code=%d\n",err);
+        goto error;
+    }
+    
+    try {
+        if (bootargs)
+            client.doJustBoot(ipsw,bootargs);
+        else
+            client.doRestore(ipsw);
+        printf("Done: restoring succeeded!\n");
+    } catch (tihmstar::exception &e) {
+        e.dump();
+        printf("Done: restoring failed!\n");
+    }
+    
+error:
+    if (err){
+        printf("Failed with error code=%d\n",err);
+    }
+    return err;
+#undef reterror
+}
+
+int main(int argc, const char * argv[]) {
+#ifdef DEBUG
+    return main_r(argc, argv);
+#else
+    try {
+        return main_r(argc, argv);
+    } catch (tihmstar::exception &e) {
+        printf("%s: failed with exception:\n",PACKAGE_NAME);
+        e.dump();
+        return e.code();
+    }
+#endif
+}
+
+# Makefile.in generated by automake 1.18.1 from Makefile.am.
+# futurerestore/Makefile.  Generated from Makefile.in by configure.
+
+# Copyright (C) 1994-2025 Free Software Foundation, Inc.
+
+# This Makefile.in is free software; the Free Software Foundation
+# gives unlimited permission to copy and/or distribute it,
+# with or without modifications, as long as this notice is preserved.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY, to the extent permitted by law; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE.
+
+
+
+
+am__is_gnu_make = { \
+  if test -z '$(MAKELEVEL)'; then \
+    false; \
+  elif test -n '$(MAKE_HOST)'; then \
+    true; \
+  elif test -n '$(MAKE_VERSION)' && test -n '$(CURDIR)'; then \
+    true; \
+  else \
+    false; \
+  fi; \
+}
+am__make_running_with_option = \
+  case $${target_option-} in \
+      ?) ;; \
+      *) echo "am__make_running_with_option: internal error: invalid" \
+              "target option '$${target_option-}' specified" >&2; \
+         exit 1;; \
+  esac; \
+  has_opt=no; \
+  sane_makeflags=$$MAKEFLAGS; \
+  if $(am__is_gnu_make); then \
+    sane_makeflags=$$MFLAGS; \
+  else \
+    case $$MAKEFLAGS in \
+      *\\[\ \	]*) \
+        bs=\\; \
+        sane_makeflags=`printf '%s\n' "$$MAKEFLAGS" \
+          | sed "s/$$bs$$bs[$$bs $$bs	]*//g"`;; \
+    esac; \
+  fi; \
+  skip_next=no; \
+  strip_trailopt () \
+  { \
+    flg=`printf '%s\n' "$$flg" | sed "s/$$1.*$$//"`; \
+  }; \
+  for flg in $$sane_makeflags; do \
+    test $$skip_next = yes && { skip_next=no; continue; }; \
+    case $$flg in \
+      *=*|--*) continue;; \
+        -*I) strip_trailopt 'I'; skip_next=yes;; \
+      -*I?*) strip_trailopt 'I';; \
+        -*O) strip_trailopt 'O'; skip_next=yes;; \
+      -*O?*) strip_trailopt 'O';; \
+        -*l) strip_trailopt 'l'; skip_next=yes;; \
+      -*l?*) strip_trailopt 'l';; \
+      -[dEDm]) skip_next=yes;; \
+      -[JT]) skip_next=yes;; \
+    esac; \
+    case $$flg in \
+      *$$target_option*) has_opt=yes; break;; \
+    esac; \
+  done; \
+  test $$has_opt = yes
+am__make_dryrun = (target_option=n; $(am__make_running_with_option))
+am__make_keepgoing = (target_option=k; $(am__make_running_with_option))
+am__rm_f = rm -f $(am__rm_f_notfound)
+am__rm_rf = rm -rf $(am__rm_f_notfound)
+pkgdatadir = $(datadir)/futurerestore
+pkgincludedir = $(includedir)/futurerestore
+pkglibdir = $(libdir)/futurerestore
+pkglibexecdir = $(libexecdir)/futurerestore
+am__cd = CDPATH="$${ZSH_VERSION+.}$(PATH_SEPARATOR)" && cd
+install_sh_DATA = $(install_sh) -c -m 644
+install_sh_PROGRAM = $(install_sh) -c
+install_sh_SCRIPT = $(install_sh) -c
+INSTALL_HEADER = $(INSTALL_DATA)
+transform = $(program_transform_name)
+NORMAL_INSTALL = :
+PRE_INSTALL = :
+POST_INSTALL = :
+NORMAL_UNINSTALL = :
+PRE_UNINSTALL = :
+POST_UNINSTALL = :
+build_triplet = x86_64-apple-darwin21.6.0
+host_triplet = x86_64-apple-darwin21.6.0
+target_triplet = x86_64-apple-darwin21.6.0
+#am__append_1 = $(libipatcher_LIBS)
+#am__append_2 = $(libipatcher_CFLAGS)
+bin_PROGRAMS = futurerestore$(EXEEXT)
+subdir = futurerestore
+ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
+am__aclocal_m4_deps = $(top_srcdir)/m4/libtool.m4 \
+	$(top_srcdir)/m4/ltoptions.m4 $(top_srcdir)/m4/ltsugar.m4 \
+	$(top_srcdir)/m4/ltversion.m4 $(top_srcdir)/m4/lt~obsolete.m4 \
+	$(top_srcdir)/configure.ac
+am__configure_deps = $(am__aclocal_m4_deps) $(CONFIGURE_DEPENDENCIES) \
+	$(ACLOCAL_M4)
+DIST_COMMON = $(srcdir)/Makefile.am $(am__DIST_COMMON)
+mkinstalldirs = $(install_sh) -d
+CONFIG_HEADER = $(top_builddir)/config.h
+CONFIG_CLEAN_FILES =
+CONFIG_CLEAN_VPATH_FILES =
+am__installdirs = "$(DESTDIR)$(bindir)"
+PROGRAMS = $(bin_PROGRAMS)
+am_futurerestore_OBJECTS = futurerestore-futurerestore.$(OBJEXT) \
+	futurerestore-main.$(OBJEXT)
+futurerestore_OBJECTS = $(am_futurerestore_OBJECTS)
+am__DEPENDENCIES_1 =
+#am__DEPENDENCIES_2 = $(am__DEPENDENCIES_1)
+am__DEPENDENCIES_3 = $(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_2)
+futurerestore_DEPENDENCIES = $(top_srcdir)/external/idevicerestore/src/libidevicerestore.la \
+	$(top_srcdir)/external/tsschecker/tsschecker/libtsschecker.la \
+	$(top_srcdir)/external/tsschecker/tsschecker/libjssy.a \
+	$(am__DEPENDENCIES_3)
+AM_V_lt = $(am__v_lt_$(V))
+am__v_lt_ = $(am__v_lt_$(AM_DEFAULT_VERBOSITY))
+am__v_lt_0 = --silent
+am__v_lt_1 = 
+futurerestore_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
+	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CXXLD) \
+	$(futurerestore_CXXFLAGS) $(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) \
+	-o $@
+AM_V_P = $(am__v_P_$(V))
+am__v_P_ = $(am__v_P_$(AM_DEFAULT_VERBOSITY))
+am__v_P_0 = false
+am__v_P_1 = :
+AM_V_GEN = $(am__v_GEN_$(V))
+am__v_GEN_ = $(am__v_GEN_$(AM_DEFAULT_VERBOSITY))
+am__v_GEN_0 = @echo "  GEN     " $@;
+am__v_GEN_1 = 
+AM_V_at = $(am__v_at_$(V))
+am__v_at_ = $(am__v_at_$(AM_DEFAULT_VERBOSITY))
+am__v_at_0 = @
+am__v_at_1 = 
+DEFAULT_INCLUDES = -I. -I$(top_builddir)
+depcomp = $(SHELL) $(top_srcdir)/depcomp
+am__maybe_remake_depfiles = depfiles
+am__depfiles_remade = ./$(DEPDIR)/futurerestore-futurerestore.Po \
+	./$(DEPDIR)/futurerestore-main.Po
+am__mv = mv -f
+CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
+	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
+LTCXXCOMPILE = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
+	$(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) \
+	$(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) \
+	$(AM_CXXFLAGS) $(CXXFLAGS)
+AM_V_CXX = $(am__v_CXX_$(V))
+am__v_CXX_ = $(am__v_CXX_$(AM_DEFAULT_VERBOSITY))
+am__v_CXX_0 = @echo "  CXX     " $@;
+am__v_CXX_1 = 
+CXXLD = $(CXX)
+CXXLINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
+	$(LIBTOOLFLAGS) --mode=link $(CXXLD) $(AM_CXXFLAGS) \
+	$(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) -o $@
+AM_V_CXXLD = $(am__v_CXXLD_$(V))
+am__v_CXXLD_ = $(am__v_CXXLD_$(AM_DEFAULT_VERBOSITY))
+am__v_CXXLD_0 = @echo "  CXXLD   " $@;
+am__v_CXXLD_1 = 
+SOURCES = $(futurerestore_SOURCES)
+DIST_SOURCES = $(futurerestore_SOURCES)
+am__can_run_installinfo = \
+  case $$AM_UPDATE_INFO_DIR in \
+    n|no|NO) false;; \
+    *) (install-info --version) >/dev/null 2>&1;; \
+  esac
+am__tagged_files = $(HEADERS) $(SOURCES) $(TAGS_FILES) $(LISP)
+# Read a list of newline-separated strings from the standard input,
+# and print each of them once, without duplicates.  Input order is
+# *not* preserved.
+am__uniquify_input = $(AWK) '\
+  BEGIN { nonempty = 0; } \
+  { items[$$0] = 1; nonempty = 1; } \
+  END { if (nonempty) { for (i in items) print i; }; } \
+'
+# Make sure the list of sources is unique.  This is necessary because,
+# e.g., the same source file might be shared among _SOURCES variables
+# for different programs/libraries.
+am__define_uniq_tagged_files = \
+  list='$(am__tagged_files)'; \
+  unique=`for i in $$list; do \
+    if test -f "$$i"; then echo $$i; else echo $(srcdir)/$$i; fi; \
+  done | $(am__uniquify_input)`
+am__DIST_COMMON = $(srcdir)/Makefile.in $(top_srcdir)/depcomp
+DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
+ACLOCAL = ${SHELL} '/Users/admin/Desktop/futurerestore-193/missing' aclocal-1.18
+AMTAR = $${TAR-tar}
+AM_DEFAULT_VERBOSITY = 1
+AR = ar
+AUTOCONF = ${SHELL} '/Users/admin/Desktop/futurerestore-193/missing' autoconf
+AUTOHEADER = ${SHELL} '/Users/admin/Desktop/futurerestore-193/missing' autoheader
+AUTOMAKE = ${SHELL} '/Users/admin/Desktop/futurerestore-193/missing' automake-1.18
+AWK = awk
+CC = gcc
+CCDEPMODE = depmode=gcc3
+CFLAGS = -g -O2 -std=gnu11
+CPPFLAGS = -I/usr/local/opt/libimobiledevice/include -I/usr/local/opt/libirecovery/include -I/usr/local/opt/libplist/include -I/usr/local/opt/libzip/include -I/usr/local/opt/curl/include -I/usr/local/opt/openssl@3/include -I/usr/local/opt/libusbmuxd/include -I/usr/local/opt/libxml2/include -I/usr/local/opt/zlib/include
+CSCOPE = cscope
+CTAGS = ctags
+CXX = g++ -std=gnu++11
+CXXCPP = g++ -std=gnu++11 -E
+CXXDEPMODE = depmode=gcc3
+CXXFLAGS = -g -O2 -stdlib=libc++ -std=gnu++11
+CYGPATH_W = echo
+DEFS = -DHAVE_CONFIG_H
+DEPDIR = .deps
+DLLTOOL = false
+DSYMUTIL = dsymutil
+DUMPBIN = 
+ECHO_C = \c
+ECHO_N = 
+ECHO_T = 
+EGREP = /usr/bin/grep -E
+ETAGS = etags
+EXEEXT = 
+FGREP = /usr/bin/grep -F
+FILECMD = file
+GREP = /usr/bin/grep
+INSTALL = /usr/bin/install -c
+INSTALL_DATA = ${INSTALL} -m 644
+INSTALL_PROGRAM = ${INSTALL}
+INSTALL_SCRIPT = ${INSTALL}
+INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
+LD = /Library/Developer/CommandLineTools/usr/bin/ld
+LDFLAGS = -L/usr/local/opt/libimobiledevice/lib -L/usr/local/opt/libirecovery/lib -L/usr/local/opt/libplist/lib -L/usr/local/opt/libzip/lib -L/usr/local/opt/curl/lib -L/usr/local/opt/openssl@3/lib -L/usr/local/opt/libusbmuxd/lib -L/usr/local/opt/libxml2/lib -L/usr/local/opt/zlib/lib
+LIBOBJS = 
+LIBS = 
+LIBTOOL = $(SHELL) $(top_builddir)/libtool
+LIPO = lipo
+LN_S = ln -s
+LTLIBOBJS = 
+LT_SYS_LIBRARY_PATH = 
+MAKEINFO = ${SHELL} '/Users/admin/Desktop/futurerestore-193/missing' makeinfo
+MANIFEST_TOOL = :
+MKDIR_P = mkdir -p
+NM = /usr/bin/nm -B
+NMEDIT = nmedit
+OBJDUMP = objdump
+OBJEXT = o
+OTOOL = otool
+OTOOL64 = :
+PACKAGE = futurerestore
+PACKAGE_BUGREPORT = tihmstar@gmail.com
+PACKAGE_NAME = futurerestore
+PACKAGE_STRING = futurerestore 193
+PACKAGE_TARNAME = futurerestore
+PACKAGE_URL = 
+PACKAGE_VERSION = 193
+PATH_SEPARATOR = :
+PKG_CONFIG = /usr/local/bin/pkg-config
+PKG_CONFIG_LIBDIR = 
+PKG_CONFIG_PATH = /Users/admin/.local/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/opt/*/lib/pkgconfig
+RANLIB = ranlib
+SED = /usr/bin/sed
+SET_MAKE = 
+SHELL = /bin/sh
+STRIP = strip
+VERSION = 193
+VERSION_COMMIT_COUNT = 193
+VERSION_COMMIT_SHA = unknown
+abs_builddir = /Users/admin/Desktop/futurerestore-193/futurerestore
+abs_srcdir = /Users/admin/Desktop/futurerestore-193/futurerestore
+abs_top_builddir = /Users/admin/Desktop/futurerestore-193
+abs_top_srcdir = /Users/admin/Desktop/futurerestore-193
+ac_ct_AR = ar
+ac_ct_CC = gcc
+ac_ct_CXX = g++
+ac_ct_DUMPBIN = 
+am__include = include
+am__leading_dot = .
+am__quote = 
+am__rm_f_notfound = 
+am__tar = tar --format=ustar -chf - "$$tardir"
+am__untar = tar -xf -
+am__xargs_n = xargs -n
+bindir = ${exec_prefix}/bin
+build = x86_64-apple-darwin21.6.0
+build_alias = 
+build_cpu = x86_64
+build_os = darwin21.6.0
+build_vendor = apple
+builddir = .
+datadir = ${datarootdir}
+datarootdir = ${prefix}/share
+docdir = ${datarootdir}/doc/${PACKAGE_TARNAME}
+dvidir = ${docdir}
+exec_prefix = ${prefix}
+host = x86_64-apple-darwin21.6.0
+host_alias = 
+host_cpu = x86_64
+host_os = darwin21.6.0
+host_vendor = apple
+htmldir = ${docdir}
+includedir = ${prefix}/include
+infodir = ${datarootdir}/info
+install_sh = ${SHELL} /Users/admin/Desktop/futurerestore-193/install-sh
+libdir = ${exec_prefix}/lib
+libexecdir = ${exec_prefix}/libexec
+libfragmentzip_CFLAGS = -I/usr/local/include
+libfragmentzip_LIBS = -L/usr/local/lib -lfragmentzip -lcurl -lz
+libgeneral_CFLAGS = -I/usr/local/include -stdlib=libc++
+libgeneral_LIBS = -L/usr/local/lib -lgeneral
+libimg4tool_CFLAGS = -I/usr/local/include -I/usr/local/Cellar/openssl@3/3.6.1/include -I/usr/local/Cellar/libplist/2.7.0/include -stdlib=libc++
+libimg4tool_LIBS = -L/usr/local/lib -limg4tool -L/usr/local/Cellar/openssl@3/3.6.1/lib -lssl -lcrypto -L/usr/local/Cellar/libplist/2.7.0/lib -lplist-2.0 -lgeneral
+libimobiledevice_CFLAGS = -I/usr/local/Cellar/libimobiledevice/1.4.0/include -I/usr/local/Cellar/libusbmuxd/2.1.1/include -I/usr/local/Cellar/libimobiledevice-glue/1.3.2/include -I/usr/local/Cellar/libplist/2.7.0/include -I/usr/local/Cellar/openssl@3/3.6.1/include
+libimobiledevice_LIBS = -L/usr/local/Cellar/libimobiledevice/1.4.0/lib -limobiledevice-1.0 -L/usr/local/Cellar/libplist/2.7.0/lib -lplist-2.0
+libipatcher_CFLAGS = 
+libipatcher_LIBS = 
+libirecovery_CFLAGS = -I/usr/local/Cellar/libirecovery/1.3.1/include -I/usr/local/Cellar/libimobiledevice-glue/1.3.2/include -I/usr/local/Cellar/libplist/2.7.0/include
+libirecovery_LIBS = -L/usr/local/Cellar/libirecovery/1.3.1/lib -lirecovery-1.0
+libplist_CFLAGS = -I/usr/local/Cellar/libplist/2.7.0/include
+libplist_LIBS = -L/usr/local/Cellar/libplist/2.7.0/lib -lplist-2.0
+libzip_CFLAGS = -I/usr/local/include
+libzip_LIBS = -L/usr/local/lib -lzip
+localedir = ${datarootdir}/locale
+localstatedir = ${prefix}/var
+mandir = ${datarootdir}/man
+mkdir_p = $(MKDIR_P)
+oldincludedir = /usr/include
+pdfdir = ${docdir}
+prefix = /usr/local
+program_transform_name = s,x,x,
+psdir = ${docdir}
+runstatedir = ${localstatedir}/run
+sbindir = ${exec_prefix}/sbin
+sharedstatedir = ${prefix}/com
+srcdir = .
+subdirs =  external/idevicerestore external/tsschecker
+sysconfdir = ${prefix}/etc
+target = x86_64-apple-darwin21.6.0
+target_alias = 
+target_cpu = x86_64
+target_os = darwin21.6.0
+target_vendor = apple
+top_build_prefix = ../
+top_builddir = ..
+top_srcdir = ..
+AM_CFLAGS = -I$(top_srcdir)/external/libgeneral/include \
+	-I$(top_srcdir)/external/tsschecker/external/jssy/jssy \
+	-I$(top_srcdir)/external/tsschecker/tsschecker \
+	-I$(top_srcdir)/external/idevicerestore/src $(libplist_CFLAGS) \
+	$(libzip_CFLAGS) $(libimobiledevice_CFLAGS) \
+	$(libfragmentzip_CFLAGS) $(libirecovery_CFLAGS) \
+	$(libimg4tool_CFLAGS) $(libgeneral_CFLAGS) $(am__append_2)
+AM_LDFLAGS = $(libplist_LIBS) $(libzip_LIBS) $(libimobiledevice_LIBS) \
+	$(libfragmentzip_LIBS) $(libirecovery_LIBS) \
+	$(libimg4tool_LIBS) $(libgeneral_LIBS) $(am__append_1)
+futurerestore_CXXFLAGS = $(AM_CFLAGS)
+futurerestore_LDADD = $(top_srcdir)/external/idevicerestore/src/libidevicerestore.la  $(top_srcdir)/external/tsschecker/tsschecker/libtsschecker.la $(top_srcdir)/external/tsschecker/tsschecker/libjssy.a $(AM_LDFLAGS)
+futurerestore_SOURCES = futurerestore.cpp main.cpp
+all: all-am
+
+.SUFFIXES:
+.SUFFIXES: .cpp .lo .o .obj
+$(srcdir)/Makefile.in:  $(srcdir)/Makefile.am  $(am__configure_deps)
+	@for dep in $?; do \
+	  case '$(am__configure_deps)' in \
+	    *$$dep*) \
+	      ( cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh ) \
+	        && { if test -f $@; then exit 0; else break; fi; }; \
+	      exit 1;; \
+	  esac; \
+	done; \
+	echo ' cd $(top_srcdir) && $(AUTOMAKE) --foreign futurerestore/Makefile'; \
+	$(am__cd) $(top_srcdir) && \
+	  $(AUTOMAKE) --foreign futurerestore/Makefile
+Makefile: $(srcdir)/Makefile.in $(top_builddir)/config.status
+	@case '$?' in \
+	  *config.status*) \
+	    cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh;; \
+	  *) \
+	    echo ' cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles)'; \
+	    cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles);; \
+	esac;
+
+$(top_builddir)/config.status: $(top_srcdir)/configure $(CONFIG_STATUS_DEPENDENCIES)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+
+$(top_srcdir)/configure:  $(am__configure_deps)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+$(ACLOCAL_M4):  $(am__aclocal_m4_deps)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+$(am__aclocal_m4_deps):
+install-binPROGRAMS: $(bin_PROGRAMS)
+	@$(NORMAL_INSTALL)
+	@list='$(bin_PROGRAMS)'; test -n "$(bindir)" || list=; \
+	if test -n "$$list"; then \
+	  echo " $(MKDIR_P) '$(DESTDIR)$(bindir)'"; \
+	  $(MKDIR_P) "$(DESTDIR)$(bindir)" || exit 1; \
+	fi; \
+	for p in $$list; do echo "$$p $$p"; done | \
+	sed 's/$(EXEEXT)$$//' | \
+	while read p p1; do if test -f $$p \
+	 || test -f $$p1 \
+	  ; then echo "$$p"; echo "$$p"; else :; fi; \
+	done | \
+	sed -e 'p;s,.*/,,;n;h' \
+	    -e 's|.*|.|' \
+	    -e 'p;x;s,.*/,,;s/$(EXEEXT)$$//;$(transform);s/$$/$(EXEEXT)/' | \
+	sed 'N;N;N;s,\n, ,g' | \
+	$(AWK) 'BEGIN { files["."] = ""; dirs["."] = 1 } \
+	  { d=$$3; if (dirs[d] != 1) { print "d", d; dirs[d] = 1 } \
+	    if ($$2 == $$4) files[d] = files[d] " " $$1; \
+	    else { print "f", $$3 "/" $$4, $$1; } } \
+	  END { for (d in files) print "f", d, files[d] }' | \
+	while read type dir files; do \
+	    if test "$$dir" = .; then dir=; else dir=/$$dir; fi; \
+	    test -z "$$files" || { \
+	    echo " $(INSTALL_PROGRAM_ENV) $(LIBTOOL) $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=install $(INSTALL_PROGRAM) $$files '$(DESTDIR)$(bindir)$$dir'"; \
+	    $(INSTALL_PROGRAM_ENV) $(LIBTOOL) $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=install $(INSTALL_PROGRAM) $$files "$(DESTDIR)$(bindir)$$dir" || exit $$?; \
+	    } \
+	; done
+
+uninstall-binPROGRAMS:
+	@$(NORMAL_UNINSTALL)
+	@list='$(bin_PROGRAMS)'; test -n "$(bindir)" || list=; \
+	files=`for p in $$list; do echo "$$p"; done | \
+	  sed -e 'h;s,^.*/,,;s/$(EXEEXT)$$//;$(transform)' \
+	      -e 's/$$/$(EXEEXT)/' \
+	`; \
+	test -n "$$list" || exit 0; \
+	echo " ( cd '$(DESTDIR)$(bindir)' && rm -f" $$files ")"; \
+	cd "$(DESTDIR)$(bindir)" && $(am__rm_f) $$files
+
+clean-binPROGRAMS:
+	$(am__rm_f) $(bin_PROGRAMS)
+	test -z "$(EXEEXT)" || $(am__rm_f) $(bin_PROGRAMS:$(EXEEXT)=)
+
+futurerestore$(EXEEXT): $(futurerestore_OBJECTS) $(futurerestore_DEPENDENCIES) $(EXTRA_futurerestore_DEPENDENCIES) 
+	@rm -f futurerestore$(EXEEXT)
+	$(AM_V_CXXLD)$(futurerestore_LINK) $(futurerestore_OBJECTS) $(futurerestore_LDADD) $(LIBS)
+
+mostlyclean-compile:
+	-rm -f *.$(OBJEXT)
+
+distclean-compile:
+	-rm -f *.tab.c
+
+include ./$(DEPDIR)/futurerestore-futurerestore.Po # am--include-marker
+include ./$(DEPDIR)/futurerestore-main.Po # am--include-marker
+
+$(am__depfiles_remade):
+	@$(MKDIR_P) $(@D)
+	@: >>$@
+
+am--depfiles: $(am__depfiles_remade)
+
+.cpp.o:
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`;\
+	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
+	$(am__mv) $$depbase.Tpo $$depbase.Po
+#	$(AM_V_CXX)source='$<' object='$@' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXXCOMPILE) -c -o $@ $<
+
+.cpp.obj:
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.obj$$||'`;\
+	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ `$(CYGPATH_W) '$<'` &&\
+	$(am__mv) $$depbase.Tpo $$depbase.Po
+#	$(AM_V_CXX)source='$<' object='$@' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXXCOMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
+
+.cpp.lo:
+	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`;\
+	$(LTCXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
+	$(am__mv) $$depbase.Tpo $$depbase.Plo
+#	$(AM_V_CXX)source='$<' object='$@' libtool=yes \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(LTCXXCOMPILE) -c -o $@ $<
+
+futurerestore-futurerestore.o: futurerestore.cpp
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-futurerestore.o -MD -MP -MF $(DEPDIR)/futurerestore-futurerestore.Tpo -c -o futurerestore-futurerestore.o `test -f 'futurerestore.cpp' || echo '$(srcdir)/'`futurerestore.cpp
+	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-futurerestore.Tpo $(DEPDIR)/futurerestore-futurerestore.Po
+#	$(AM_V_CXX)source='futurerestore.cpp' object='futurerestore-futurerestore.o' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-futurerestore.o `test -f 'futurerestore.cpp' || echo '$(srcdir)/'`futurerestore.cpp
+
+futurerestore-futurerestore.obj: futurerestore.cpp
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-futurerestore.obj -MD -MP -MF $(DEPDIR)/futurerestore-futurerestore.Tpo -c -o futurerestore-futurerestore.obj `if test -f 'futurerestore.cpp'; then $(CYGPATH_W) 'futurerestore.cpp'; else $(CYGPATH_W) '$(srcdir)/futurerestore.cpp'; fi`
+	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-futurerestore.Tpo $(DEPDIR)/futurerestore-futurerestore.Po
+#	$(AM_V_CXX)source='futurerestore.cpp' object='futurerestore-futurerestore.obj' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-futurerestore.obj `if test -f 'futurerestore.cpp'; then $(CYGPATH_W) 'futurerestore.cpp'; else $(CYGPATH_W) '$(srcdir)/futurerestore.cpp'; fi`
+
+futurerestore-main.o: main.cpp
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-main.o -MD -MP -MF $(DEPDIR)/futurerestore-main.Tpo -c -o futurerestore-main.o `test -f 'main.cpp' || echo '$(srcdir)/'`main.cpp
+	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-main.Tpo $(DEPDIR)/futurerestore-main.Po
+#	$(AM_V_CXX)source='main.cpp' object='futurerestore-main.o' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-main.o `test -f 'main.cpp' || echo '$(srcdir)/'`main.cpp
+
+futurerestore-main.obj: main.cpp
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-main.obj -MD -MP -MF $(DEPDIR)/futurerestore-main.Tpo -c -o futurerestore-main.obj `if test -f 'main.cpp'; then $(CYGPATH_W) 'main.cpp'; else $(CYGPATH_W) '$(srcdir)/main.cpp'; fi`
+	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-main.Tpo $(DEPDIR)/futurerestore-main.Po
+#	$(AM_V_CXX)source='main.cpp' object='futurerestore-main.obj' libtool=no \
+#	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) \
+#	$(AM_V_CXX_no)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-main.obj `if test -f 'main.cpp'; then $(CYGPATH_W) 'main.cpp'; else $(CYGPATH_W) '$(srcdir)/main.cpp'; fi`
+
+mostlyclean-libtool:
+	-rm -f *.lo
+
+clean-libtool:
+	-rm -rf .libs _libs
+
+ID: $(am__tagged_files)
+	$(am__define_uniq_tagged_files); mkid -fID $$unique
+tags: tags-am
+TAGS: tags
+
+tags-am: $(TAGS_DEPENDENCIES) $(am__tagged_files)
+	set x; \
+	here=`pwd`; \
+	$(am__define_uniq_tagged_files); \
+	shift; \
+	if test -z "$(ETAGS_ARGS)$$*$$unique"; then :; else \
+	  test -n "$$unique" || unique=$$empty_fix; \
+	  if test $$# -gt 0; then \
+	    $(ETAGS) $(ETAGSFLAGS) $(AM_ETAGSFLAGS) $(ETAGS_ARGS) \
+	      "$$@" $$unique; \
+	  else \
+	    $(ETAGS) $(ETAGSFLAGS) $(AM_ETAGSFLAGS) $(ETAGS_ARGS) \
+	      $$unique; \
+	  fi; \
+	fi
+ctags: ctags-am
+
+CTAGS: ctags
+ctags-am: $(TAGS_DEPENDENCIES) $(am__tagged_files)
+	$(am__define_uniq_tagged_files); \
+	test -z "$(CTAGS_ARGS)$$unique" \
+	  || $(CTAGS) $(CTAGSFLAGS) $(AM_CTAGSFLAGS) $(CTAGS_ARGS) \
+	     $$unique
+
+GTAGS:
+	here=`$(am__cd) $(top_builddir) && pwd` \
+	  && $(am__cd) $(top_srcdir) \
+	  && gtags -i $(GTAGS_ARGS) "$$here"
+cscopelist: cscopelist-am
+
+cscopelist-am: $(am__tagged_files)
+	list='$(am__tagged_files)'; \
+	case "$(srcdir)" in \
+	  [\\/]* | ?:[\\/]*) sdir="$(srcdir)" ;; \
+	  *) sdir=$(subdir)/$(srcdir) ;; \
+	esac; \
+	for i in $$list; do \
+	  if test -f "$$i"; then \
+	    echo "$(subdir)/$$i"; \
+	  else \
+	    echo "$$sdir/$$i"; \
+	  fi; \
+	done >> $(top_builddir)/cscope.files
+
+distclean-tags:
+	-rm -f TAGS ID GTAGS GRTAGS GSYMS GPATH tags
+
+distdir: $(BUILT_SOURCES)
+	$(MAKE) $(AM_MAKEFLAGS) distdir-am
+
+distdir-am: $(DISTFILES)
+	@srcdirstrip=`echo "$(srcdir)" | sed 's/[].[^$$\\*]/\\\\&/g'`; \
+	topsrcdirstrip=`echo "$(top_srcdir)" | sed 's/[].[^$$\\*]/\\\\&/g'`; \
+	list='$(DISTFILES)'; \
+	  dist_files=`for file in $$list; do echo $$file; done | \
+	  sed -e "s|^$$srcdirstrip/||;t" \
+	      -e "s|^$$topsrcdirstrip/|$(top_builddir)/|;t"`; \
+	case $$dist_files in \
+	  */*) $(MKDIR_P) `echo "$$dist_files" | \
+			   sed '/\//!d;s|^|$(distdir)/|;s,/[^/]*$$,,' | \
+			   sort -u` ;; \
+	esac; \
+	for file in $$dist_files; do \
+	  if test -f $$file || test -d $$file; then d=.; else d=$(srcdir); fi; \
+	  if test -d $$d/$$file; then \
+	    dir=`echo "/$$file" | sed -e 's,/[^/]*$$,,'`; \
+	    if test -d "$(distdir)/$$file"; then \
+	      find "$(distdir)/$$file" -type d ! -perm -700 -exec chmod u+rwx {} \;; \
+	    fi; \
+	    if test -d $(srcdir)/$$file && test $$d != $(srcdir); then \
+	      cp -fpR $(srcdir)/$$file "$(distdir)$$dir" || exit 1; \
+	      find "$(distdir)/$$file" -type d ! -perm -700 -exec chmod u+rwx {} \;; \
+	    fi; \
+	    cp -fpR $$d/$$file "$(distdir)$$dir" || exit 1; \
+	  else \
+	    test -f "$(distdir)/$$file" \
+	    || cp -p $$d/$$file "$(distdir)/$$file" \
+	    || exit 1; \
+	  fi; \
+	done
+check-am: all-am
+check: check-am
+all-am: Makefile $(PROGRAMS)
+installdirs:
+	for dir in "$(DESTDIR)$(bindir)"; do \
+	  test -z "$$dir" || $(MKDIR_P) "$$dir"; \
+	done
+install: install-am
+install-exec: install-exec-am
+install-data: install-data-am
+uninstall: uninstall-am
+
+install-am: all-am
+	@$(MAKE) $(AM_MAKEFLAGS) install-exec-am install-data-am
+
+installcheck: installcheck-am
+install-strip:
+	if test -z '$(STRIP)'; then \
+	  $(MAKE) $(AM_MAKEFLAGS) INSTALL_PROGRAM="$(INSTALL_STRIP_PROGRAM)" \
+	    install_sh_PROGRAM="$(INSTALL_STRIP_PROGRAM)" INSTALL_STRIP_FLAG=-s \
+	      install; \
+	else \
+	  $(MAKE) $(AM_MAKEFLAGS) INSTALL_PROGRAM="$(INSTALL_STRIP_PROGRAM)" \
+	    install_sh_PROGRAM="$(INSTALL_STRIP_PROGRAM)" INSTALL_STRIP_FLAG=-s \
+	    "INSTALL_PROGRAM_ENV=STRIPPROG='$(STRIP)'" install; \
+	fi
+mostlyclean-generic:
+
+clean-generic:
+
+distclean-generic:
+	-$(am__rm_f) $(CONFIG_CLEAN_FILES)
+	-test . = "$(srcdir)" || $(am__rm_f) $(CONFIG_CLEAN_VPATH_FILES)
+
+maintainer-clean-generic:
+	@echo "This command is intended for maintainers to use"
+	@echo "it deletes files that may require special tools to rebuild."
+clean: clean-am
+
+clean-am: clean-binPROGRAMS clean-generic clean-libtool mostlyclean-am
+
+distclean: distclean-am
+	-rm -f ./$(DEPDIR)/futurerestore-futurerestore.Po
+	-rm -f ./$(DEPDIR)/futurerestore-main.Po
+	-rm -f Makefile
+distclean-am: clean-am distclean-compile distclean-generic \
+	distclean-tags
+
+dvi: dvi-am
+
+dvi-am:
+
+html: html-am
+
+html-am:
+
+info: info-am
+
+info-am:
+
+install-data-am:
+
+install-dvi: install-dvi-am
+
+install-dvi-am:
+
+install-exec-am: install-binPROGRAMS
+
+install-html: install-html-am
+
+install-html-am:
+
+install-info: install-info-am
+
+install-info-am:
+
+install-man:
+
+install-pdf: install-pdf-am
+
+install-pdf-am:
+
+install-ps: install-ps-am
+
+install-ps-am:
+
+installcheck-am:
+
+maintainer-clean: maintainer-clean-am
+	-rm -f ./$(DEPDIR)/futurerestore-futurerestore.Po
+	-rm -f ./$(DEPDIR)/futurerestore-main.Po
+	-rm -f Makefile
+maintainer-clean-am: distclean-am maintainer-clean-generic
+
+mostlyclean: mostlyclean-am
+
+mostlyclean-am: mostlyclean-compile mostlyclean-generic \
+	mostlyclean-libtool
+
+pdf: pdf-am
+
+pdf-am:
+
+ps: ps-am
+
+ps-am:
+
+uninstall-am: uninstall-binPROGRAMS
+
+.MAKE: install-am install-strip
+
+.PHONY: CTAGS GTAGS TAGS all all-am am--depfiles check check-am clean \
+	clean-binPROGRAMS clean-generic clean-libtool cscopelist-am \
+	ctags ctags-am distclean distclean-compile distclean-generic \
+	distclean-libtool distclean-tags distdir dvi dvi-am html \
+	html-am info info-am install install-am install-binPROGRAMS \
+	install-data install-data-am install-dvi install-dvi-am \
+	install-exec install-exec-am install-html install-html-am \
+	install-info install-info-am install-man install-pdf \
+	install-pdf-am install-ps install-ps-am install-strip \
+	installcheck installcheck-am installdirs maintainer-clean \
+	maintainer-clean-generic mostlyclean mostlyclean-compile \
+	mostlyclean-generic mostlyclean-libtool pdf pdf-am ps ps-am \
+	tags tags-am uninstall uninstall-am uninstall-binPROGRAMS
+
+.PRECIOUS: Makefile
+
+
+# Tell versions [3.59,3.63) of GNU make to not export all variables.
+# Otherwise a system limit (for SysV at least) may be exceeded.
+.NOEXPORT:
+
+# Tell GNU make to disable its built-in pattern rules.
+%:: %,v
+%:: RCS/%,v
+%:: RCS/%
+%:: s.%
+%:: SCCS/s.%
+
+AM_CFLAGS = -I$(top_srcdir)/external/libgeneral/include -I$(top_srcdir)/external/tsschecker/external/jssy/jssy -I$(top_srcdir)/external/tsschecker/tsschecker -I$(top_srcdir)/external/idevicerestore/src $(libplist_CFLAGS) $(libzip_CFLAGS) $(libimobiledevice_CFLAGS) $(libfragmentzip_CFLAGS) $(libirecovery_CFLAGS) $(libimg4tool_CFLAGS) $(libgeneral_CFLAGS)
+AM_LDFLAGS = $(libplist_LIBS) $(libzip_LIBS) $(libimobiledevice_LIBS) $(libfragmentzip_LIBS) $(libirecovery_LIBS) $(libimg4tool_LIBS) $(libgeneral_LIBS)
+
+if HAVE_LIBIPATCHER
+AM_LDFLAGS += $(libipatcher_LIBS)
+AM_CFLAGS += $(libipatcher_CFLAGS)
+endif
+
+bin_PROGRAMS = futurerestore
+futurerestore_CXXFLAGS = $(AM_CFLAGS)
+futurerestore_LDADD = $(top_srcdir)/external/idevicerestore/src/libidevicerestore.la  $(top_srcdir)/external/tsschecker/tsschecker/libtsschecker.la $(top_srcdir)/external/tsschecker/tsschecker/libjssy.a $(AM_LDFLAGS)
+futurerestore_SOURCES = futurerestore.cpp main.cpp
+
+# Makefile.in generated by automake 1.18.1 from Makefile.am.
+# @configure_input@
+
+# Copyright (C) 1994-2025 Free Software Foundation, Inc.
+
+# This Makefile.in is free software; the Free Software Foundation
+# gives unlimited permission to copy and/or distribute it,
+# with or without modifications, as long as this notice is preserved.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY, to the extent permitted by law; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE.
+
+@SET_MAKE@
+
+VPATH = @srcdir@
+am__is_gnu_make = { \
+  if test -z '$(MAKELEVEL)'; then \
+    false; \
+  elif test -n '$(MAKE_HOST)'; then \
+    true; \
+  elif test -n '$(MAKE_VERSION)' && test -n '$(CURDIR)'; then \
+    true; \
+  else \
+    false; \
+  fi; \
+}
+am__make_running_with_option = \
+  case $${target_option-} in \
+      ?) ;; \
+      *) echo "am__make_running_with_option: internal error: invalid" \
+              "target option '$${target_option-}' specified" >&2; \
+         exit 1;; \
+  esac; \
+  has_opt=no; \
+  sane_makeflags=$$MAKEFLAGS; \
+  if $(am__is_gnu_make); then \
+    sane_makeflags=$$MFLAGS; \
+  else \
+    case $$MAKEFLAGS in \
+      *\\[\ \	]*) \
+        bs=\\; \
+        sane_makeflags=`printf '%s\n' "$$MAKEFLAGS" \
+          | sed "s/$$bs$$bs[$$bs $$bs	]*//g"`;; \
+    esac; \
+  fi; \
+  skip_next=no; \
+  strip_trailopt () \
+  { \
+    flg=`printf '%s\n' "$$flg" | sed "s/$$1.*$$//"`; \
+  }; \
+  for flg in $$sane_makeflags; do \
+    test $$skip_next = yes && { skip_next=no; continue; }; \
+    case $$flg in \
+      *=*|--*) continue;; \
+        -*I) strip_trailopt 'I'; skip_next=yes;; \
+      -*I?*) strip_trailopt 'I';; \
+        -*O) strip_trailopt 'O'; skip_next=yes;; \
+      -*O?*) strip_trailopt 'O';; \
+        -*l) strip_trailopt 'l'; skip_next=yes;; \
+      -*l?*) strip_trailopt 'l';; \
+      -[dEDm]) skip_next=yes;; \
+      -[JT]) skip_next=yes;; \
+    esac; \
+    case $$flg in \
+      *$$target_option*) has_opt=yes; break;; \
+    esac; \
+  done; \
+  test $$has_opt = yes
+am__make_dryrun = (target_option=n; $(am__make_running_with_option))
+am__make_keepgoing = (target_option=k; $(am__make_running_with_option))
+am__rm_f = rm -f $(am__rm_f_notfound)
+am__rm_rf = rm -rf $(am__rm_f_notfound)
+pkgdatadir = $(datadir)/@PACKAGE@
+pkgincludedir = $(includedir)/@PACKAGE@
+pkglibdir = $(libdir)/@PACKAGE@
+pkglibexecdir = $(libexecdir)/@PACKAGE@
+am__cd = CDPATH="$${ZSH_VERSION+.}$(PATH_SEPARATOR)" && cd
+install_sh_DATA = $(install_sh) -c -m 644
+install_sh_PROGRAM = $(install_sh) -c
+install_sh_SCRIPT = $(install_sh) -c
+INSTALL_HEADER = $(INSTALL_DATA)
+transform = $(program_transform_name)
+NORMAL_INSTALL = :
+PRE_INSTALL = :
+POST_INSTALL = :
+NORMAL_UNINSTALL = :
+PRE_UNINSTALL = :
+POST_UNINSTALL = :
+build_triplet = @build@
+host_triplet = @host@
+target_triplet = @target@
+@HAVE_LIBIPATCHER_TRUE@am__append_1 = $(libipatcher_LIBS)
+@HAVE_LIBIPATCHER_TRUE@am__append_2 = $(libipatcher_CFLAGS)
+bin_PROGRAMS = futurerestore$(EXEEXT)
+subdir = futurerestore
+ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
+am__aclocal_m4_deps = $(top_srcdir)/m4/libtool.m4 \
+	$(top_srcdir)/m4/ltoptions.m4 $(top_srcdir)/m4/ltsugar.m4 \
+	$(top_srcdir)/m4/ltversion.m4 $(top_srcdir)/m4/lt~obsolete.m4 \
+	$(top_srcdir)/configure.ac
+am__configure_deps = $(am__aclocal_m4_deps) $(CONFIGURE_DEPENDENCIES) \
+	$(ACLOCAL_M4)
+DIST_COMMON = $(srcdir)/Makefile.am $(am__DIST_COMMON)
+mkinstalldirs = $(install_sh) -d
+CONFIG_HEADER = $(top_builddir)/config.h
+CONFIG_CLEAN_FILES =
+CONFIG_CLEAN_VPATH_FILES =
+am__installdirs = "$(DESTDIR)$(bindir)"
+PROGRAMS = $(bin_PROGRAMS)
+am_futurerestore_OBJECTS = futurerestore-futurerestore.$(OBJEXT) \
+	futurerestore-main.$(OBJEXT)
+futurerestore_OBJECTS = $(am_futurerestore_OBJECTS)
+am__DEPENDENCIES_1 =
+@HAVE_LIBIPATCHER_TRUE@am__DEPENDENCIES_2 = $(am__DEPENDENCIES_1)
+am__DEPENDENCIES_3 = $(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
+	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_2)
+futurerestore_DEPENDENCIES = $(top_srcdir)/external/idevicerestore/src/libidevicerestore.la \
+	$(top_srcdir)/external/tsschecker/tsschecker/libtsschecker.la \
+	$(top_srcdir)/external/tsschecker/tsschecker/libjssy.a \
+	$(am__DEPENDENCIES_3)
+AM_V_lt = $(am__v_lt_@AM_V@)
+am__v_lt_ = $(am__v_lt_@AM_DEFAULT_V@)
+am__v_lt_0 = --silent
+am__v_lt_1 = 
+futurerestore_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX \
+	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CXXLD) \
+	$(futurerestore_CXXFLAGS) $(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) \
+	-o $@
+AM_V_P = $(am__v_P_@AM_V@)
+am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
+am__v_P_0 = false
+am__v_P_1 = :
+AM_V_GEN = $(am__v_GEN_@AM_V@)
+am__v_GEN_ = $(am__v_GEN_@AM_DEFAULT_V@)
+am__v_GEN_0 = @echo "  GEN     " $@;
+am__v_GEN_1 = 
+AM_V_at = $(am__v_at_@AM_V@)
+am__v_at_ = $(am__v_at_@AM_DEFAULT_V@)
+am__v_at_0 = @
+am__v_at_1 = 
+DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)
+depcomp = $(SHELL) $(top_srcdir)/depcomp
+am__maybe_remake_depfiles = depfiles
+am__depfiles_remade = ./$(DEPDIR)/futurerestore-futurerestore.Po \
+	./$(DEPDIR)/futurerestore-main.Po
+am__mv = mv -f
+CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
+	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
+LTCXXCOMPILE = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
+	$(LIBTOOLFLAGS) --mode=compile $(CXX) $(DEFS) \
+	$(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) \
+	$(AM_CXXFLAGS) $(CXXFLAGS)
+AM_V_CXX = $(am__v_CXX_@AM_V@)
+am__v_CXX_ = $(am__v_CXX_@AM_DEFAULT_V@)
+am__v_CXX_0 = @echo "  CXX     " $@;
+am__v_CXX_1 = 
+CXXLD = $(CXX)
+CXXLINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
+	$(LIBTOOLFLAGS) --mode=link $(CXXLD) $(AM_CXXFLAGS) \
+	$(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) -o $@
+AM_V_CXXLD = $(am__v_CXXLD_@AM_V@)
+am__v_CXXLD_ = $(am__v_CXXLD_@AM_DEFAULT_V@)
+am__v_CXXLD_0 = @echo "  CXXLD   " $@;
+am__v_CXXLD_1 = 
+SOURCES = $(futurerestore_SOURCES)
+DIST_SOURCES = $(futurerestore_SOURCES)
+am__can_run_installinfo = \
+  case $$AM_UPDATE_INFO_DIR in \
+    n|no|NO) false;; \
+    *) (install-info --version) >/dev/null 2>&1;; \
+  esac
+am__tagged_files = $(HEADERS) $(SOURCES) $(TAGS_FILES) $(LISP)
+# Read a list of newline-separated strings from the standard input,
+# and print each of them once, without duplicates.  Input order is
+# *not* preserved.
+am__uniquify_input = $(AWK) '\
+  BEGIN { nonempty = 0; } \
+  { items[$$0] = 1; nonempty = 1; } \
+  END { if (nonempty) { for (i in items) print i; }; } \
+'
+# Make sure the list of sources is unique.  This is necessary because,
+# e.g., the same source file might be shared among _SOURCES variables
+# for different programs/libraries.
+am__define_uniq_tagged_files = \
+  list='$(am__tagged_files)'; \
+  unique=`for i in $$list; do \
+    if test -f "$$i"; then echo $$i; else echo $(srcdir)/$$i; fi; \
+  done | $(am__uniquify_input)`
+am__DIST_COMMON = $(srcdir)/Makefile.in $(top_srcdir)/depcomp
+DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
+ACLOCAL = @ACLOCAL@
+AMTAR = @AMTAR@
+AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
+AR = @AR@
+AUTOCONF = @AUTOCONF@
+AUTOHEADER = @AUTOHEADER@
+AUTOMAKE = @AUTOMAKE@
+AWK = @AWK@
+CC = @CC@
+CCDEPMODE = @CCDEPMODE@
+CFLAGS = @CFLAGS@
+CPPFLAGS = @CPPFLAGS@
+CSCOPE = @CSCOPE@
+CTAGS = @CTAGS@
+CXX = @CXX@
+CXXCPP = @CXXCPP@
+CXXDEPMODE = @CXXDEPMODE@
+CXXFLAGS = @CXXFLAGS@
+CYGPATH_W = @CYGPATH_W@
+DEFS = @DEFS@
+DEPDIR = @DEPDIR@
+DLLTOOL = @DLLTOOL@
+DSYMUTIL = @DSYMUTIL@
+DUMPBIN = @DUMPBIN@
+ECHO_C = @ECHO_C@
+ECHO_N = @ECHO_N@
+ECHO_T = @ECHO_T@
+EGREP = @EGREP@
+ETAGS = @ETAGS@
+EXEEXT = @EXEEXT@
+FGREP = @FGREP@
+FILECMD = @FILECMD@
+GREP = @GREP@
+INSTALL = @INSTALL@
+INSTALL_DATA = @INSTALL_DATA@
+INSTALL_PROGRAM = @INSTALL_PROGRAM@
+INSTALL_SCRIPT = @INSTALL_SCRIPT@
+INSTALL_STRIP_PROGRAM = @INSTALL_STRIP_PROGRAM@
+LD = @LD@
+LDFLAGS = @LDFLAGS@
+LIBOBJS = @LIBOBJS@
+LIBS = @LIBS@
+LIBTOOL = @LIBTOOL@
+LIPO = @LIPO@
+LN_S = @LN_S@
+LTLIBOBJS = @LTLIBOBJS@
+LT_SYS_LIBRARY_PATH = @LT_SYS_LIBRARY_PATH@
+MAKEINFO = @MAKEINFO@
+MANIFEST_TOOL = @MANIFEST_TOOL@
+MKDIR_P = @MKDIR_P@
+NM = @NM@
+NMEDIT = @NMEDIT@
+OBJDUMP = @OBJDUMP@
+OBJEXT = @OBJEXT@
+OTOOL = @OTOOL@
+OTOOL64 = @OTOOL64@
+PACKAGE = @PACKAGE@
+PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+PACKAGE_NAME = @PACKAGE_NAME@
+PACKAGE_STRING = @PACKAGE_STRING@
+PACKAGE_TARNAME = @PACKAGE_TARNAME@
+PACKAGE_URL = @PACKAGE_URL@
+PACKAGE_VERSION = @PACKAGE_VERSION@
+PATH_SEPARATOR = @PATH_SEPARATOR@
+PKG_CONFIG = @PKG_CONFIG@
+PKG_CONFIG_LIBDIR = @PKG_CONFIG_LIBDIR@
+PKG_CONFIG_PATH = @PKG_CONFIG_PATH@
+RANLIB = @RANLIB@
+SED = @SED@
+SET_MAKE = @SET_MAKE@
+SHELL = @SHELL@
+STRIP = @STRIP@
+VERSION = @VERSION@
+VERSION_COMMIT_COUNT = @VERSION_COMMIT_COUNT@
+VERSION_COMMIT_SHA = @VERSION_COMMIT_SHA@
+abs_builddir = @abs_builddir@
+abs_srcdir = @abs_srcdir@
+abs_top_builddir = @abs_top_builddir@
+abs_top_srcdir = @abs_top_srcdir@
+ac_ct_AR = @ac_ct_AR@
+ac_ct_CC = @ac_ct_CC@
+ac_ct_CXX = @ac_ct_CXX@
+ac_ct_DUMPBIN = @ac_ct_DUMPBIN@
+am__include = @am__include@
+am__leading_dot = @am__leading_dot@
+am__quote = @am__quote@
+am__rm_f_notfound = @am__rm_f_notfound@
+am__tar = @am__tar@
+am__untar = @am__untar@
+am__xargs_n = @am__xargs_n@
+bindir = @bindir@
+build = @build@
+build_alias = @build_alias@
+build_cpu = @build_cpu@
+build_os = @build_os@
+build_vendor = @build_vendor@
+builddir = @builddir@
+datadir = @datadir@
+datarootdir = @datarootdir@
+docdir = @docdir@
+dvidir = @dvidir@
+exec_prefix = @exec_prefix@
+host = @host@
+host_alias = @host_alias@
+host_cpu = @host_cpu@
+host_os = @host_os@
+host_vendor = @host_vendor@
+htmldir = @htmldir@
+includedir = @includedir@
+infodir = @infodir@
+install_sh = @install_sh@
+libdir = @libdir@
+libexecdir = @libexecdir@
+libfragmentzip_CFLAGS = @libfragmentzip_CFLAGS@
+libfragmentzip_LIBS = @libfragmentzip_LIBS@
+libgeneral_CFLAGS = @libgeneral_CFLAGS@
+libgeneral_LIBS = @libgeneral_LIBS@
+libimg4tool_CFLAGS = @libimg4tool_CFLAGS@
+libimg4tool_LIBS = @libimg4tool_LIBS@
+libimobiledevice_CFLAGS = @libimobiledevice_CFLAGS@
+libimobiledevice_LIBS = @libimobiledevice_LIBS@
+libipatcher_CFLAGS = @libipatcher_CFLAGS@
+libipatcher_LIBS = @libipatcher_LIBS@
+libirecovery_CFLAGS = @libirecovery_CFLAGS@
+libirecovery_LIBS = @libirecovery_LIBS@
+libplist_CFLAGS = @libplist_CFLAGS@
+libplist_LIBS = @libplist_LIBS@
+libzip_CFLAGS = @libzip_CFLAGS@
+libzip_LIBS = @libzip_LIBS@
+localedir = @localedir@
+localstatedir = @localstatedir@
+mandir = @mandir@
+mkdir_p = @mkdir_p@
+oldincludedir = @oldincludedir@
+pdfdir = @pdfdir@
+prefix = @prefix@
+program_transform_name = @program_transform_name@
+psdir = @psdir@
+runstatedir = @runstatedir@
+sbindir = @sbindir@
+sharedstatedir = @sharedstatedir@
+srcdir = @srcdir@
+subdirs = @subdirs@
+sysconfdir = @sysconfdir@
+target = @target@
+target_alias = @target_alias@
+target_cpu = @target_cpu@
+target_os = @target_os@
+target_vendor = @target_vendor@
+top_build_prefix = @top_build_prefix@
+top_builddir = @top_builddir@
+top_srcdir = @top_srcdir@
+AM_CFLAGS = -I$(top_srcdir)/external/libgeneral/include \
+	-I$(top_srcdir)/external/tsschecker/external/jssy/jssy \
+	-I$(top_srcdir)/external/tsschecker/tsschecker \
+	-I$(top_srcdir)/external/idevicerestore/src $(libplist_CFLAGS) \
+	$(libzip_CFLAGS) $(libimobiledevice_CFLAGS) \
+	$(libfragmentzip_CFLAGS) $(libirecovery_CFLAGS) \
+	$(libimg4tool_CFLAGS) $(libgeneral_CFLAGS) $(am__append_2)
+AM_LDFLAGS = $(libplist_LIBS) $(libzip_LIBS) $(libimobiledevice_LIBS) \
+	$(libfragmentzip_LIBS) $(libirecovery_LIBS) \
+	$(libimg4tool_LIBS) $(libgeneral_LIBS) $(am__append_1)
+futurerestore_CXXFLAGS = $(AM_CFLAGS)
+futurerestore_LDADD = $(top_srcdir)/external/idevicerestore/src/libidevicerestore.la  $(top_srcdir)/external/tsschecker/tsschecker/libtsschecker.la $(top_srcdir)/external/tsschecker/tsschecker/libjssy.a $(AM_LDFLAGS)
+futurerestore_SOURCES = futurerestore.cpp main.cpp
+all: all-am
+
+.SUFFIXES:
+.SUFFIXES: .cpp .lo .o .obj
+$(srcdir)/Makefile.in:  $(srcdir)/Makefile.am  $(am__configure_deps)
+	@for dep in $?; do \
+	  case '$(am__configure_deps)' in \
+	    *$$dep*) \
+	      ( cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh ) \
+	        && { if test -f $@; then exit 0; else break; fi; }; \
+	      exit 1;; \
+	  esac; \
+	done; \
+	echo ' cd $(top_srcdir) && $(AUTOMAKE) --foreign futurerestore/Makefile'; \
+	$(am__cd) $(top_srcdir) && \
+	  $(AUTOMAKE) --foreign futurerestore/Makefile
+Makefile: $(srcdir)/Makefile.in $(top_builddir)/config.status
+	@case '$?' in \
+	  *config.status*) \
+	    cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh;; \
+	  *) \
+	    echo ' cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles)'; \
+	    cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__maybe_remake_depfiles);; \
+	esac;
+
+$(top_builddir)/config.status: $(top_srcdir)/configure $(CONFIG_STATUS_DEPENDENCIES)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+
+$(top_srcdir)/configure:  $(am__configure_deps)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+$(ACLOCAL_M4):  $(am__aclocal_m4_deps)
+	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
+$(am__aclocal_m4_deps):
+install-binPROGRAMS: $(bin_PROGRAMS)
+	@$(NORMAL_INSTALL)
+	@list='$(bin_PROGRAMS)'; test -n "$(bindir)" || list=; \
+	if test -n "$$list"; then \
+	  echo " $(MKDIR_P) '$(DESTDIR)$(bindir)'"; \
+	  $(MKDIR_P) "$(DESTDIR)$(bindir)" || exit 1; \
+	fi; \
+	for p in $$list; do echo "$$p $$p"; done | \
+	sed 's/$(EXEEXT)$$//' | \
+	while read p p1; do if test -f $$p \
+	 || test -f $$p1 \
+	  ; then echo "$$p"; echo "$$p"; else :; fi; \
+	done | \
+	sed -e 'p;s,.*/,,;n;h' \
+	    -e 's|.*|.|' \
+	    -e 'p;x;s,.*/,,;s/$(EXEEXT)$$//;$(transform);s/$$/$(EXEEXT)/' | \
+	sed 'N;N;N;s,\n, ,g' | \
+	$(AWK) 'BEGIN { files["."] = ""; dirs["."] = 1 } \
+	  { d=$$3; if (dirs[d] != 1) { print "d", d; dirs[d] = 1 } \
+	    if ($$2 == $$4) files[d] = files[d] " " $$1; \
+	    else { print "f", $$3 "/" $$4, $$1; } } \
+	  END { for (d in files) print "f", d, files[d] }' | \
+	while read type dir files; do \
+	    if test "$$dir" = .; then dir=; else dir=/$$dir; fi; \
+	    test -z "$$files" || { \
+	    echo " $(INSTALL_PROGRAM_ENV) $(LIBTOOL) $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=install $(INSTALL_PROGRAM) $$files '$(DESTDIR)$(bindir)$$dir'"; \
+	    $(INSTALL_PROGRAM_ENV) $(LIBTOOL) $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=install $(INSTALL_PROGRAM) $$files "$(DESTDIR)$(bindir)$$dir" || exit $$?; \
+	    } \
+	; done
+
+uninstall-binPROGRAMS:
+	@$(NORMAL_UNINSTALL)
+	@list='$(bin_PROGRAMS)'; test -n "$(bindir)" || list=; \
+	files=`for p in $$list; do echo "$$p"; done | \
+	  sed -e 'h;s,^.*/,,;s/$(EXEEXT)$$//;$(transform)' \
+	      -e 's/$$/$(EXEEXT)/' \
+	`; \
+	test -n "$$list" || exit 0; \
+	echo " ( cd '$(DESTDIR)$(bindir)' && rm -f" $$files ")"; \
+	cd "$(DESTDIR)$(bindir)" && $(am__rm_f) $$files
+
+clean-binPROGRAMS:
+	$(am__rm_f) $(bin_PROGRAMS)
+	test -z "$(EXEEXT)" || $(am__rm_f) $(bin_PROGRAMS:$(EXEEXT)=)
+
+futurerestore$(EXEEXT): $(futurerestore_OBJECTS) $(futurerestore_DEPENDENCIES) $(EXTRA_futurerestore_DEPENDENCIES) 
+	@rm -f futurerestore$(EXEEXT)
+	$(AM_V_CXXLD)$(futurerestore_LINK) $(futurerestore_OBJECTS) $(futurerestore_LDADD) $(LIBS)
+
+mostlyclean-compile:
+	-rm -f *.$(OBJEXT)
+
+distclean-compile:
+	-rm -f *.tab.c
+
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futurerestore-futurerestore.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/futurerestore-main.Po@am__quote@ # am--include-marker
+
+$(am__depfiles_remade):
+	@$(MKDIR_P) $(@D)
+	@: >>$@
+
+am--depfiles: $(am__depfiles_remade)
+
+.cpp.o:
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`;\
+@am__fastdepCXX_TRUE@	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
+@am__fastdepCXX_TRUE@	$(am__mv) $$depbase.Tpo $$depbase.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXXCOMPILE) -c -o $@ $<
+
+.cpp.obj:
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.obj$$||'`;\
+@am__fastdepCXX_TRUE@	$(CXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ `$(CYGPATH_W) '$<'` &&\
+@am__fastdepCXX_TRUE@	$(am__mv) $$depbase.Tpo $$depbase.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXXCOMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
+
+.cpp.lo:
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.lo$$||'`;\
+@am__fastdepCXX_TRUE@	$(LTCXXCOMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
+@am__fastdepCXX_TRUE@	$(am__mv) $$depbase.Tpo $$depbase.Plo
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='$<' object='$@' libtool=yes @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(LTCXXCOMPILE) -c -o $@ $<
+
+futurerestore-futurerestore.o: futurerestore.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-futurerestore.o -MD -MP -MF $(DEPDIR)/futurerestore-futurerestore.Tpo -c -o futurerestore-futurerestore.o `test -f 'futurerestore.cpp' || echo '$(srcdir)/'`futurerestore.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-futurerestore.Tpo $(DEPDIR)/futurerestore-futurerestore.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='futurerestore.cpp' object='futurerestore-futurerestore.o' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-futurerestore.o `test -f 'futurerestore.cpp' || echo '$(srcdir)/'`futurerestore.cpp
+
+futurerestore-futurerestore.obj: futurerestore.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-futurerestore.obj -MD -MP -MF $(DEPDIR)/futurerestore-futurerestore.Tpo -c -o futurerestore-futurerestore.obj `if test -f 'futurerestore.cpp'; then $(CYGPATH_W) 'futurerestore.cpp'; else $(CYGPATH_W) '$(srcdir)/futurerestore.cpp'; fi`
+@am__fastdepCXX_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-futurerestore.Tpo $(DEPDIR)/futurerestore-futurerestore.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='futurerestore.cpp' object='futurerestore-futurerestore.obj' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-futurerestore.obj `if test -f 'futurerestore.cpp'; then $(CYGPATH_W) 'futurerestore.cpp'; else $(CYGPATH_W) '$(srcdir)/futurerestore.cpp'; fi`
+
+futurerestore-main.o: main.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-main.o -MD -MP -MF $(DEPDIR)/futurerestore-main.Tpo -c -o futurerestore-main.o `test -f 'main.cpp' || echo '$(srcdir)/'`main.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-main.Tpo $(DEPDIR)/futurerestore-main.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='main.cpp' object='futurerestore-main.o' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-main.o `test -f 'main.cpp' || echo '$(srcdir)/'`main.cpp
+
+futurerestore-main.obj: main.cpp
+@am__fastdepCXX_TRUE@	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -MT futurerestore-main.obj -MD -MP -MF $(DEPDIR)/futurerestore-main.Tpo -c -o futurerestore-main.obj `if test -f 'main.cpp'; then $(CYGPATH_W) 'main.cpp'; else $(CYGPATH_W) '$(srcdir)/main.cpp'; fi`
+@am__fastdepCXX_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/futurerestore-main.Tpo $(DEPDIR)/futurerestore-main.Po
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	$(AM_V_CXX)source='main.cpp' object='futurerestore-main.obj' libtool=no @AMDEPBACKSLASH@
+@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+@am__fastdepCXX_FALSE@	$(AM_V_CXX@am__nodep@)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(futurerestore_CXXFLAGS) $(CXXFLAGS) -c -o futurerestore-main.obj `if test -f 'main.cpp'; then $(CYGPATH_W) 'main.cpp'; else $(CYGPATH_W) '$(srcdir)/main.cpp'; fi`
+
+mostlyclean-libtool:
+	-rm -f *.lo
+
+clean-libtool:
+	-rm -rf .libs _libs
+
+ID: $(am__tagged_files)
+	$(am__define_uniq_tagged_files); mkid -fID $$unique
+tags: tags-am
+TAGS: tags
+
+tags-am: $(TAGS_DEPENDENCIES) $(am__tagged_files)
+	set x; \
+	here=`pwd`; \
+	$(am__define_uniq_tagged_files); \
+	shift; \
+	if test -z "$(ETAGS_ARGS)$$*$$unique"; then :; else \
+	  test -n "$$unique" || unique=$$empty_fix; \
+	  if test $$# -gt 0; then \
+	    $(ETAGS) $(ETAGSFLAGS) $(AM_ETAGSFLAGS) $(ETAGS_ARGS) \
+	      "$$@" $$unique; \
+	  else \
+	    $(ETAGS) $(ETAGSFLAGS) $(AM_ETAGSFLAGS) $(ETAGS_ARGS) \
+	      $$unique; \
+	  fi; \
+	fi
+ctags: ctags-am
+
+CTAGS: ctags
+ctags-am: $(TAGS_DEPENDENCIES) $(am__tagged_files)
+	$(am__define_uniq_tagged_files); \
+	test -z "$(CTAGS_ARGS)$$unique" \
+	  || $(CTAGS) $(CTAGSFLAGS) $(AM_CTAGSFLAGS) $(CTAGS_ARGS) \
+	     $$unique
+
+GTAGS:
+	here=`$(am__cd) $(top_builddir) && pwd` \
+	  && $(am__cd) $(top_srcdir) \
+	  && gtags -i $(GTAGS_ARGS) "$$here"
+cscopelist: cscopelist-am
+
+cscopelist-am: $(am__tagged_files)
+	list='$(am__tagged_files)'; \
+	case "$(srcdir)" in \
+	  [\\/]* | ?:[\\/]*) sdir="$(srcdir)" ;; \
+	  *) sdir=$(subdir)/$(srcdir) ;; \
+	esac; \
+	for i in $$list; do \
+	  if test -f "$$i"; then \
+	    echo "$(subdir)/$$i"; \
+	  else \
+	    echo "$$sdir/$$i"; \
+	  fi; \
+	done >> $(top_builddir)/cscope.files
+
+distclean-tags:
+	-rm -f TAGS ID GTAGS GRTAGS GSYMS GPATH tags
+
+distdir: $(BUILT_SOURCES)
+	$(MAKE) $(AM_MAKEFLAGS) distdir-am
+
+distdir-am: $(DISTFILES)
+	@srcdirstrip=`echo "$(srcdir)" | sed 's/[].[^$$\\*]/\\\\&/g'`; \
+	topsrcdirstrip=`echo "$(top_srcdir)" | sed 's/[].[^$$\\*]/\\\\&/g'`; \
+	list='$(DISTFILES)'; \
+	  dist_files=`for file in $$list; do echo $$file; done | \
+	  sed -e "s|^$$srcdirstrip/||;t" \
+	      -e "s|^$$topsrcdirstrip/|$(top_builddir)/|;t"`; \
+	case $$dist_files in \
+	  */*) $(MKDIR_P) `echo "$$dist_files" | \
+			   sed '/\//!d;s|^|$(distdir)/|;s,/[^/]*$$,,' | \
+			   sort -u` ;; \
+	esac; \
+	for file in $$dist_files; do \
+	  if test -f $$file || test -d $$file; then d=.; else d=$(srcdir); fi; \
+	  if test -d $$d/$$file; then \
+	    dir=`echo "/$$file" | sed -e 's,/[^/]*$$,,'`; \
+	    if test -d "$(distdir)/$$file"; then \
+	      find "$(distdir)/$$file" -type d ! -perm -700 -exec chmod u+rwx {} \;; \
+	    fi; \
+	    if test -d $(srcdir)/$$file && test $$d != $(srcdir); then \
+	      cp -fpR $(srcdir)/$$file "$(distdir)$$dir" || exit 1; \
+	      find "$(distdir)/$$file" -type d ! -perm -700 -exec chmod u+rwx {} \;; \
+	    fi; \
+	    cp -fpR $$d/$$file "$(distdir)$$dir" || exit 1; \
+	  else \
+	    test -f "$(distdir)/$$file" \
+	    || cp -p $$d/$$file "$(distdir)/$$file" \
+	    || exit 1; \
+	  fi; \
+	done
+check-am: all-am
+check: check-am
+all-am: Makefile $(PROGRAMS)
+installdirs:
+	for dir in "$(DESTDIR)$(bindir)"; do \
+	  test -z "$$dir" || $(MKDIR_P) "$$dir"; \
+	done
+install: install-am
+install-exec: install-exec-am
+install-data: install-data-am
+uninstall: uninstall-am
+
+install-am: all-am
+	@$(MAKE) $(AM_MAKEFLAGS) install-exec-am install-data-am
+
+installcheck: installcheck-am
+install-strip:
+	if test -z '$(STRIP)'; then \
+	  $(MAKE) $(AM_MAKEFLAGS) INSTALL_PROGRAM="$(INSTALL_STRIP_PROGRAM)" \
+	    install_sh_PROGRAM="$(INSTALL_STRIP_PROGRAM)" INSTALL_STRIP_FLAG=-s \
+	      install; \
+	else \
+	  $(MAKE) $(AM_MAKEFLAGS) INSTALL_PROGRAM="$(INSTALL_STRIP_PROGRAM)" \
+	    install_sh_PROGRAM="$(INSTALL_STRIP_PROGRAM)" INSTALL_STRIP_FLAG=-s \
+	    "INSTALL_PROGRAM_ENV=STRIPPROG='$(STRIP)'" install; \
+	fi
+mostlyclean-generic:
+
+clean-generic:
+
+distclean-generic:
+	-$(am__rm_f) $(CONFIG_CLEAN_FILES)
+	-test . = "$(srcdir)" || $(am__rm_f) $(CONFIG_CLEAN_VPATH_FILES)
+
+maintainer-clean-generic:
+	@echo "This command is intended for maintainers to use"
+	@echo "it deletes files that may require special tools to rebuild."
+clean: clean-am
+
+clean-am: clean-binPROGRAMS clean-generic clean-libtool mostlyclean-am
+
+distclean: distclean-am
+	-rm -f ./$(DEPDIR)/futurerestore-futurerestore.Po
+	-rm -f ./$(DEPDIR)/futurerestore-main.Po
+	-rm -f Makefile
+distclean-am: clean-am distclean-compile distclean-generic \
+	distclean-tags
+
+dvi: dvi-am
+
+dvi-am:
+
+html: html-am
+
+html-am:
+
+info: info-am
+
+info-am:
+
+install-data-am:
+
+install-dvi: install-dvi-am
+
+install-dvi-am:
+
+install-exec-am: install-binPROGRAMS
+
+install-html: install-html-am
+
+install-html-am:
+
+install-info: install-info-am
+
+install-info-am:
+
+install-man:
+
+install-pdf: install-pdf-am
+
+install-pdf-am:
+
+install-ps: install-ps-am
+
+install-ps-am:
+
+installcheck-am:
+
+maintainer-clean: maintainer-clean-am
+	-rm -f ./$(DEPDIR)/futurerestore-futurerestore.Po
+	-rm -f ./$(DEPDIR)/futurerestore-main.Po
+	-rm -f Makefile
+maintainer-clean-am: distclean-am maintainer-clean-generic
+
+mostlyclean: mostlyclean-am
+
+mostlyclean-am: mostlyclean-compile mostlyclean-generic \
+	mostlyclean-libtool
+
+pdf: pdf-am
+
+pdf-am:
+
+ps: ps-am
+
+ps-am:
+
+uninstall-am: uninstall-binPROGRAMS
+
+.MAKE: install-am install-strip
+
+.PHONY: CTAGS GTAGS TAGS all all-am am--depfiles check check-am clean \
+	clean-binPROGRAMS clean-generic clean-libtool cscopelist-am \
+	ctags ctags-am distclean distclean-compile distclean-generic \
+	distclean-libtool distclean-tags distdir dvi dvi-am html \
+	html-am info info-am install install-am install-binPROGRAMS \
+	install-data install-data-am install-dvi install-dvi-am \
+	install-exec install-exec-am install-html install-html-am \
+	install-info install-info-am install-man install-pdf \
+	install-pdf-am install-ps install-ps-am install-strip \
+	installcheck installcheck-am installdirs maintainer-clean \
+	maintainer-clean-generic mostlyclean mostlyclean-compile \
+	mostlyclean-generic mostlyclean-libtool pdf pdf-am ps ps-am \
+	tags tags-am uninstall uninstall-am uninstall-binPROGRAMS
+
+.PRECIOUS: Makefile
+
+
+# Tell versions [3.59,3.63) of GNU make to not export all variables.
+# Otherwise a system limit (for SysV at least) may be exceeded.
+.NOEXPORT:
+
+# Tell GNU make to disable its built-in pattern rules.
+%:: %,v
+%:: RCS/%,v
+%:: RCS/%
+%:: s.%
+%:: SCCS/s.%
+
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(TOOLCHAIN_PREFIX /usr/local/bin/x86_64-w64-mingw32-)
+set(CMAKE_C_COMPILER ${TOOLCHAIN_PREFIX}gcc)
+set(CMAKE_CXX_COMPILER ${TOOLCHAIN_PREFIX}g++)
+set(CMAKE_RC_COMPILER ${TOOLCHAIN_PREFIX}windres
+set(CMAKE_FIND_ROOT_PATH /usr/local/x86_64-w64-mingw32)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static -DCURL_STATICLIB")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -lpthread")
